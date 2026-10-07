@@ -39,6 +39,9 @@ pub struct Entry {
     pub cwd: PathBuf,
     pub agent: Agent,
     pub session_id: Option<Uuid>,
+    /// Title IDs remain candidates until verified by live metadata, hooks, or explicit binding.
+    #[serde(default)]
+    pub session_verified: bool,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -53,6 +56,13 @@ pub struct Entry {
     pub imported: bool,
     #[serde(default)]
     pub ever_started: bool,
+}
+impl Entry {
+    pub fn needs_session(&self) -> bool {
+        matches!(self.agent, Agent::Codex | Agent::Claude)
+            && (self.imported || self.ever_started)
+            && (self.session_id.is_none() || !self.session_verified)
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {

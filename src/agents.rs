@@ -62,11 +62,13 @@ pub fn launch(store: &Store, id: Uuid, token: Uuid) -> Result<i32> {
                 exit_code: None,
             },
         );
-        s.entries
+        let saved = s
+            .entries
             .iter_mut()
             .find(|e| e.id == id)
-            .context("Unknown tab")?
-            .ever_started = true;
+            .context("Unknown tab")?;
+        saved.ever_started = true;
+        saved.imported = false;
         Ok(())
     })?;
     let result = run_command(store, &entry, token);
@@ -249,6 +251,7 @@ pub fn apply_hook(store: &Store, id: Uuid, token: Uuid, agent: Agent, input: &Va
                     && let Some(e) = s.entries.iter_mut().find(|e| e.id == id)
                 {
                     e.session_id = Some(conversation);
+                    e.session_verified = true;
                 }
             }
             "SubagentStart" => {
@@ -302,6 +305,7 @@ mod tests {
                     cwd: dir.path().into(),
                     agent: Agent::Codex,
                     session_id: None,
+                    session_verified: false,
                     args: vec![],
                     command: vec![],
                     isolated: false,

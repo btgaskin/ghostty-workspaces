@@ -1,5 +1,7 @@
 mod agents;
+mod binding;
 mod ghostty;
+mod hardware;
 mod model;
 mod process;
 mod ui;
@@ -16,6 +18,9 @@ use uuid::Uuid;
 struct Cli {
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
+    /// Add a read-only macmon stream from an SSH host (repeat for additional devices).
+    #[arg(long, global = true, value_name = "HOST")]
+    ssh: Vec<String>,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -63,7 +68,26 @@ enum Action {
     /// Close a tab through Ghostty, retaining its saved conversation and directory.
     Park { id: Uuid },
     /// Attach an exact conversation ID to a saved tab whose ID could not be imported.
-    Bind { id: Uuid, session: Uuid },
+    Bind {
+        #[arg(
+            required_unless_present_any = ["all", "auto"],
+            conflicts_with_all = ["all", "auto"],
+            requires = "session"
+        )]
+        id: Option<Uuid>,
+        #[arg(requires = "id")]
+        session: Option<Uuid>,
+        /// Walk through unresolved agent tabs, accepting exact IDs or skipping each one.
+        #[arg(long)]
+        all: bool,
+        /// Bind unique live Codex matches from process ancestry and open root metadata.
+        #[arg(long, conflicts_with = "all")]
+        auto: bool,
+        #[arg(long, conflicts_with = "id")]
+        dry_run: bool,
+    },
+    /// Print current hardware samples as JSON; missing or disconnected sensors are explicit.
+    Sensors,
     /// Remove a saved tab from the workspace. Does not stop processes or delete agent history.
     Forget { id: Uuid },
     /// Print integration health and storage location.
@@ -153,7 +177,7 @@ fn main() {
     let cli = Cli::parse();
     let hook = matches!(cli.command, Some(Action::Hook { .. }));
     let result = Store::new(cli.state_dir)
-        .and_then(|s| dispatch(s, cli.command.unwrap_or(Action::Dashboard)));
+        .and_then(|s| dispatch(s, cli.command.unwrap_or(Action::Dashboard), cli.ssh));
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
@@ -165,14 +189,20 @@ fn main() {
         }
     }
 }
-fn dispatch(store: Store, action: Action) -> Result<i32> {
+fn dispatch(store: Store, action: Action, hosts: Vec<String>) -> Result<i32> {
+    hardware::validate_hosts(&hosts)?;
     match action.normalize() {
-        Action::Dashboard => ui::run(&store)?,
+        Action::Dashboard => ui::run(&store, &hosts)?,
         Action::Launch => {
+            let remote = hosts
+                .iter()
+                .map(|h| format!(" --ssh {}", ghostty::shell_quote(h)))
+                .collect::<String>();
             let command = format!(
-                "{} --state-dir {} dashboard",
+                "{} --state-dir {} dashboard{}",
                 ghostty::shell_quote(&std::env::current_exe()?.to_string_lossy()),
-                ghostty::shell_quote(&store.dir.to_string_lossy())
+                ghostty::shell_quote(&store.dir.to_string_lossy()),
+                remote
             );
             ghostty::open(
                 &std::env::current_dir()?.to_string_lossy(),
@@ -247,6 +277,7 @@ fn dispatch(store: Store, action: Action) -> Result<i32> {
                 cwd,
                 agent,
                 session_id: session,
+                session_verified: session.is_some(),
                 args: if agent == Agent::Command {
                     vec![]
                 } else {
@@ -279,20 +310,29 @@ fn dispatch(store: Store, action: Action) -> Result<i32> {
             park_entry(&store, id)?;
             println!("Tab closed; saved session retained.");
         }
-        Action::Bind { id, session } => {
-            store.update(|s| {
-                if !matches!(s.entry(id)?.agent, Agent::Codex | Agent::Claude) {
-                    bail!("Only agent tabs have conversation IDs")
+        Action::Bind {
+            id,
+            session,
+            all,
+            auto,
+            dry_run,
+        } => {
+            if all {
+                binding::automatic(&store, dry_run)?;
+                if !dry_run {
+                    binding::all(&store, false)?;
                 }
-                s.entries
-                    .iter_mut()
-                    .find(|e| e.id == id)
-                    .context("Unknown saved tab")?
-                    .session_id = Some(session);
-                Ok(())
-            })?;
-            println!("Bound {id} to {session}");
+            } else if auto {
+                binding::automatic(&store, dry_run)?;
+            } else {
+                binding::one(
+                    &store,
+                    id.context("Missing tab ID")?,
+                    session.context("Missing conversation ID")?,
+                )?;
+            }
         }
+        Action::Sensors => return hardware::print_samples(&hosts),
         Action::Forget { id } => {
             store.update(|s| {
                 s.entry(id)?;
@@ -319,6 +359,12 @@ fn dispatch(store: Store, action: Action) -> Result<i32> {
             println!(
                 "Managed launches add scoped hooks; Codex may require trusting them in /hooks."
             );
+            println!(
+                "Hardware sampler: {}",
+                hardware::local_binary()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or("macmon not found (optional)".into())
+            );
         }
         Action::Run { id, token } => return agents::launch(&store, id, token),
         Action::Hook { id, token, agent } => agents::hook(&store, id, token, agent)?,
@@ -336,7 +382,9 @@ pub fn terminal_id(store: &Store, id: Uuid) -> Result<String> {
 pub fn park_entry(store: &Store, id: Uuid) -> Result<()> {
     let state = store.read()?;
     let entry = state.entry(id)?;
-    if matches!(entry.agent, Agent::Codex | Agent::Claude) && entry.session_id.is_none() {
+    if matches!(entry.agent, Agent::Codex | Agent::Claude)
+        && (entry.session_id.is_none() || entry.needs_session())
+    {
         bail!(
             "Capture or bind this tab's conversation ID before parking it: gws bind {id} <session-id>"
         )
@@ -367,10 +415,7 @@ pub fn open_entry(store: &Store, id: Uuid, window: Option<&str>) -> Result<Strin
     {
         bail!("The launcher is already running; refusing to start a duplicate agent")
     }
-    if (entry.imported || entry.ever_started)
-        && matches!(entry.agent, Agent::Codex | Agent::Claude)
-        && entry.session_id.is_none()
-    {
+    if entry.needs_session() {
         bail!(
             "{} needs an exact session ID: gws bind {} <session-id>",
             entry.name,
@@ -428,13 +473,15 @@ pub fn open_entry(store: &Store, id: Uuid, window: Option<&str>) -> Result<Strin
 fn save(store: &Store, workspace: &str) -> Result<()> {
     let windows = ghostty::snapshot()?;
     let mut count = 0;
-    let mut missing = 0;
     let mut splits = 0;
     store.update(|s| {
         let mut entries = vec![];
         for (group, w) in windows.iter().enumerate() {
             for tab in &w.tabs {
-                if tab.name == "Ghostty Workspaces" {
+                if matches!(
+                    tab.name.as_str(),
+                    "Ghostty Workspaces" | "gws" | "gws dashboard"
+                ) {
                     continue;
                 }
                 if tab.terminals.len() > 1 {
@@ -450,6 +497,17 @@ fn save(store: &Store, workspace: &str) -> Result<()> {
                         e.workspace = workspace.into();
                         e.window = group;
                         e.cwd = PathBuf::from(&p.cwd);
+                        if e.imported {
+                            let name = tab.name.replace(['\n', '\r', '\t'], " ");
+                            if e.name != name {
+                                e.session_verified = false;
+                            }
+                            e.name = name;
+                            e.isolated = tab.name.split_whitespace().any(|s| s == "--no-daemon");
+                        }
+                        if !e.session_verified && matches!(e.agent, Agent::Codex | Agent::Claude) {
+                            e.session_id = agents::session_from_title(&tab.name);
+                        }
                         e
                     } else {
                         let agent = if tab.name.split_whitespace().any(|s| s == "codex") {
@@ -470,6 +528,7 @@ fn save(store: &Store, workspace: &str) -> Result<()> {
                             } else {
                                 None
                             },
+                            session_verified: false,
                             args: vec![],
                             command: vec![],
                             isolated: tab.name.contains("--no-daemon"),
@@ -479,9 +538,6 @@ fn save(store: &Store, workspace: &str) -> Result<()> {
                             ever_started: false,
                         }
                     };
-                    if matches!(e.agent, Agent::Codex | Agent::Claude) && e.session_id.is_none() {
-                        missing += 1;
-                    }
                     entries.push(e);
                     count += 1;
                 }
@@ -495,6 +551,13 @@ fn save(store: &Store, workspace: &str) -> Result<()> {
         s.runs.retain(|id, _| saved.contains(id));
         Ok(())
     })?;
+    binding::automatic(store, false)?;
+    let missing = store
+        .read()?
+        .entries
+        .iter()
+        .filter(|e| e.workspace == workspace && e.needs_session())
+        .count();
     println!(
         "Saved {count} terminals across {} windows to {workspace}.",
         windows.len()
@@ -534,10 +597,7 @@ fn restore(store: &Store, workspace: &str, dry: bool) -> Result<()> {
             println!("Open: {}", e.name);
             continue;
         }
-        if (e.imported || e.ever_started)
-            && matches!(e.agent, Agent::Codex | Agent::Claude)
-            && e.session_id.is_none()
-        {
+        if e.needs_session() {
             println!("Needs session ID: {} ({})", e.name, e.id);
             skipped += 1;
             continue;
