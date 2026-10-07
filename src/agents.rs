@@ -83,15 +83,10 @@ pub fn launch(store: &Store, id: Uuid, token: Uuid) -> Result<i32> {
 }
 fn run_command(store: &Store, entry: &Entry, token: Uuid) -> Result<i32> {
     let hook_config = hooks(store, entry, token)?;
+    let provider_args = provider_args(entry, token);
     let mut cmd = match entry.agent {
         Agent::Codex => {
             let mut c = Command::new(executable("codex")?);
-            if let Some(id) = entry.session_id {
-                c.args(["resume", &id.to_string()]);
-            }
-            if entry.isolated {
-                c.arg("--no-daemon");
-            }
             for (event, groups) in hook_config["hooks"].as_object().context("Invalid hooks")? {
                 // JSON strings are valid TOML strings; object keys need TOML '=' syntax.
                 let command = groups[0]["hooks"][0]["command"]
@@ -105,18 +100,13 @@ fn run_command(store: &Store, entry: &Entry, token: Uuid) -> Result<i32> {
                     ),
                 ]);
             }
-            c.args(&entry.args);
+            c.args(&provider_args);
             c
         }
         Agent::Claude => {
             let mut c = Command::new(executable("claude")?);
-            if let Some(id) = entry.session_id {
-                c.args(["--resume", &id.to_string()]);
-            } else {
-                c.args(["--session-id", &token.to_string()]);
-            }
             c.args(["--settings", &serde_json::to_string(&hook_config)?]);
-            c.args(&entry.args);
+            c.args(&provider_args);
             c
         }
         Agent::Shell => {
@@ -143,6 +133,41 @@ fn run_command(store: &Store, entry: &Entry, token: Uuid) -> Result<i32> {
         )
     })?;
     Ok(status.code().unwrap_or(1))
+}
+pub fn provider_args(entry: &Entry, token: Uuid) -> Vec<String> {
+    let mut args = entry.args.clone();
+    if let Some(id) = entry.session_id {
+        let identity_command = match entry.agent {
+            Agent::Codex => matches!(args.first().map(String::as_str), Some("resume" | "fork")),
+            Agent::Claude => matches!(args.first().map(String::as_str), Some("--resume" | "-r")),
+            _ => false,
+        };
+        if identity_command {
+            args.remove(0);
+            if args.first().is_some_and(|s| !s.starts_with('-')) {
+                args.remove(0);
+            }
+        }
+        if entry.agent == Agent::Codex {
+            args.retain(|a| a != "--last" && a != "--all");
+        }
+        let flag = if entry.agent == Agent::Claude {
+            "--resume"
+        } else {
+            "resume"
+        };
+        args.splice(0..0, [flag.to_owned(), id.to_string()]);
+    } else if entry.agent == Agent::Claude
+        && !args
+            .iter()
+            .any(|a| matches!(a.as_str(), "--resume" | "-r" | "--continue" | "-c"))
+    {
+        args.splice(0..0, ["--session-id".into(), token.to_string()]);
+    }
+    if entry.agent == Agent::Codex && entry.isolated && !args.iter().any(|a| a == "--no-daemon") {
+        args.push("--no-daemon".into());
+    }
+    args
 }
 fn launch_path() -> Result<std::ffi::OsString> {
     let mut dirs: Vec<_> =
@@ -384,6 +409,48 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::read_to_string(path).unwrap(), "broken");
+    }
+    #[test]
+    fn provider_arguments_keep_no_daemon_opt_in_and_resume_one_exact_thread() {
+        let (_dir, store, id, token) = fixture();
+        let mut entry = store.read().unwrap().entry(id).unwrap().clone();
+        assert!(
+            !provider_args(&entry, token)
+                .iter()
+                .any(|a| a == "--no-daemon")
+        );
+        entry.args = vec![
+            "resume".into(),
+            "old-session-name".into(),
+            "--no-daemon".into(),
+        ];
+        entry.isolated = true;
+        let thread = Uuid::new_v4();
+        entry.session_id = Some(thread);
+        assert_eq!(
+            provider_args(&entry, token),
+            ["resume", &thread.to_string(), "--no-daemon"]
+        );
+        entry.args = vec!["resume".into(), "--last".into()];
+        entry.isolated = false;
+        assert_eq!(
+            provider_args(&entry, token),
+            ["resume", &thread.to_string()]
+        );
+    }
+    #[test]
+    fn claude_resume_does_not_generate_a_second_session_id() {
+        let (_dir, store, id, token) = fixture();
+        let mut entry = store.read().unwrap().entry(id).unwrap().clone();
+        entry.agent = Agent::Claude;
+        entry.args = vec!["--resume".into(), "named-conversation".into()];
+        assert_eq!(provider_args(&entry, token), entry.args);
+        let thread = Uuid::new_v4();
+        entry.session_id = Some(thread);
+        assert_eq!(
+            provider_args(&entry, token),
+            ["--resume", &thread.to_string()]
+        );
     }
     #[test]
     fn imports_only_explicit_session_ids() {

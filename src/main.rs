@@ -4,7 +4,7 @@ mod model;
 mod process;
 mod ui;
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use model::{Agent, Entry, Store};
 use std::{collections::BTreeMap, path::PathBuf};
 use uuid::Uuid;
@@ -37,22 +37,19 @@ enum Action {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Create a saved, managed tab.
+    /// Start a saved Codex tab in the current directory or a supplied project directory.
+    Codex(LaunchOptions),
+    /// Start a saved Claude Code tab in the current directory or a supplied project directory.
+    Claude(LaunchOptions),
+    /// Start a saved shell tab.
+    Shell(LaunchOptions),
+    /// Start a saved command tab; pass its executable and arguments after --.
+    Command(LaunchOptions),
+    /// Create a saved, managed tab (compatibility spelling).
     New {
         agent: Agent,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long, default_value = "default")]
-        workspace: String,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        #[arg(long)]
-        session: Option<Uuid>,
-        /// Give Codex a private server so its process tree can be attributed to this tab.
-        #[arg(long)]
-        isolated: bool,
-        #[arg(last = true)]
-        args: Vec<String>,
+        #[command(flatten)]
+        options: LaunchOptions,
     },
     /// Show saved tabs, IDs, session continuity, and owned process metrics.
     List {
@@ -76,6 +73,82 @@ enum Action {
     #[command(hide = true)]
     Hook { id: Uuid, token: Uuid, agent: Agent },
 }
+#[derive(Args, Debug)]
+#[command(subcommand_precedence_over_arg = true)]
+struct LaunchOptions {
+    /// Project directory; defaults to the directory where gws is invoked.
+    #[arg(value_name = "DIRECTORY", conflicts_with = "cwd")]
+    directory: Option<PathBuf>,
+    #[arg(long, global = true)]
+    name: Option<String>,
+    #[arg(long, global = true, default_value = "default")]
+    workspace: String,
+    /// Alternative spelling for the project directory.
+    #[arg(short = 'C', long, global = true, value_name = "DIRECTORY")]
+    cwd: Option<PathBuf>,
+    #[arg(long, global = true)]
+    session: Option<Uuid>,
+    /// Give Codex a private server so its process tree can be attributed to this tab.
+    #[arg(long = "no-daemon", alias = "isolated", global = true)]
+    isolated: bool,
+    #[command(subcommand)]
+    subcommand: Option<AgentSubcommand>,
+    /// Agent options, or a custom executable and its arguments, after --.
+    #[arg(last = true)]
+    args: Vec<String>,
+}
+#[derive(Subcommand, Debug)]
+enum AgentSubcommand {
+    /// Resume an agent conversation by ID/name, or open its session picker.
+    Resume {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Fork a Codex conversation by ID/name, or open its session picker.
+    Fork {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+impl Action {
+    fn normalize(self) -> Self {
+        match self {
+            Self::Codex(options) => Self::New {
+                agent: Agent::Codex,
+                options,
+            },
+            Self::Claude(options) => Self::New {
+                agent: Agent::Claude,
+                options,
+            },
+            Self::Shell(options) => Self::New {
+                agent: Agent::Shell,
+                options,
+            },
+            Self::Command(options) => Self::New {
+                agent: Agent::Command,
+                options,
+            },
+            other => other,
+        }
+    }
+}
+impl LaunchOptions {
+    fn project_directory(&self) -> Result<PathBuf> {
+        let directory = self
+            .directory
+            .clone()
+            .or_else(|| self.cwd.clone())
+            .unwrap_or(std::env::current_dir()?);
+        let directory = directory
+            .canonicalize()
+            .context("Working directory does not exist")?;
+        if !directory.is_dir() {
+            bail!("Working directory must be a directory")
+        }
+        Ok(directory)
+    }
+}
 fn main() {
     let cli = Cli::parse();
     let hook = matches!(cli.command, Some(Action::Hook { .. }));
@@ -93,7 +166,7 @@ fn main() {
     }
 }
 fn dispatch(store: Store, action: Action) -> Result<i32> {
-    match action {
+    match action.normalize() {
         Action::Dashboard => ui::run(&store)?,
         Action::Launch => {
             let command = format!(
@@ -110,21 +183,49 @@ fn dispatch(store: Store, action: Action) -> Result<i32> {
         }
         Action::Save { workspace } => save(&store, &workspace)?,
         Action::Restore { workspace, dry_run } => restore(&store, &workspace, dry_run)?,
-        Action::New {
-            agent,
-            name,
-            workspace,
-            cwd,
-            session,
-            isolated,
-            args,
-        } => {
-            let cwd = cwd
-                .unwrap_or(std::env::current_dir()?)
-                .canonicalize()
-                .context("Working directory does not exist")?;
-            if !cwd.is_dir() {
-                bail!("Working directory must be a directory")
+        Action::Codex(_) | Action::Claude(_) | Action::Shell(_) | Action::Command(_) => {
+            unreachable!("Shorthand launches are normalized to New")
+        }
+        Action::New { agent, options } => {
+            let cwd = options.project_directory()?;
+            let LaunchOptions {
+                name,
+                workspace,
+                session,
+                isolated,
+                mut args,
+                subcommand,
+                ..
+            } = options;
+            if let Some(command) = subcommand {
+                if session.is_some() {
+                    bail!("Use either --session or an agent subcommand")
+                }
+                match (agent, command) {
+                    (Agent::Codex, AgentSubcommand::Resume { args: command_args }) => {
+                        args = std::iter::once("resume".into())
+                            .chain(command_args)
+                            .chain(args)
+                            .collect();
+                    }
+                    (Agent::Codex, AgentSubcommand::Fork { args: command_args }) => {
+                        args = std::iter::once("fork".into())
+                            .chain(command_args)
+                            .chain(args)
+                            .collect();
+                    }
+                    (Agent::Claude, AgentSubcommand::Resume { args: command_args }) => {
+                        args = std::iter::once("--resume".into())
+                            .chain(command_args)
+                            .chain(args)
+                            .collect();
+                    }
+                    _ => bail!("This agent does not support that managed subcommand"),
+                }
+            }
+            let isolated = isolated || args.iter().any(|arg| arg == "--no-daemon");
+            if isolated && agent != Agent::Codex {
+                bail!("--no-daemon is a Codex option")
             }
             if matches!(agent, Agent::Shell | Agent::Command) && session.is_some() {
                 bail!("Only agent tabs have conversation IDs")
@@ -456,4 +557,68 @@ fn restore(store: &Store, workspace: &str, dry: bool) -> Result<()> {
         bail!("{skipped} tabs could not be restored without their exact conversation IDs")
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    fn launch(args: &[&str]) -> (Agent, LaunchOptions) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command.unwrap().normalize() {
+            Action::New { agent, options } => (agent, options),
+            _ => panic!("Expected a launch"),
+        }
+    }
+    #[test]
+    fn shorthand_defaults_to_current_directory_without_no_daemon() {
+        let (agent, options) = launch(&["gws", "codex"]);
+        assert_eq!(agent, Agent::Codex);
+        assert_eq!(
+            options.project_directory().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+        assert!(!options.isolated);
+    }
+    #[test]
+    fn accepts_project_directory_and_compatibility_spelling() {
+        for args in [
+            &["gws", "codex", ".", "--name", "Project"][..],
+            &["gws", "new", "codex", "--cwd", ".", "--name", "Project"][..],
+        ] {
+            let (agent, options) = launch(args);
+            assert_eq!(agent, Agent::Codex);
+            assert!(options.project_directory().unwrap().is_dir());
+            assert_eq!(options.name.as_deref(), Some("Project"));
+        }
+        assert!(Cli::try_parse_from(["gws", "codex", ".", "--cwd", "."]).is_err());
+    }
+    #[test]
+    fn accepts_opt_in_no_daemon_and_native_resume_subcommand() {
+        let (_, options) = launch(&["gws", "codex", "--no-daemon"]);
+        assert!(options.isolated);
+        let (_, options) = launch(&[
+            "gws",
+            "codex",
+            "--cwd",
+            ".",
+            "resume",
+            "example-session",
+            "--no-daemon",
+        ]);
+        assert!(matches!(
+            options.subcommand,
+            Some(AgentSubcommand::Resume { .. })
+        ));
+        assert!(options.project_directory().unwrap().is_dir());
+        let (_, options) = launch(&["gws", "codex", "resume", "--last", "--no-daemon"]);
+        assert!(matches!(
+            options.subcommand,
+            Some(AgentSubcommand::Resume { .. })
+        ));
+    }
+    #[test]
+    fn forwards_options_after_separator() {
+        let (_, options) = launch(&["gws", "codex", "--", "--model", "example"]);
+        assert_eq!(options.args, ["--model", "example"]);
+    }
 }

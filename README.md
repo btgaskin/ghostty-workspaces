@@ -24,13 +24,16 @@ macOS may ask your launching terminal for permission to automate Ghostty. Agent 
 Create tabs through `gws` for reliable process ownership and automatic session capture:
 
 ```sh
-gws new codex --cwd ~/dev/my-project --name 'Project · Codex'
-gws new claude --cwd ~/dev/my-project --name 'Project · Claude'
-gws new shell --cwd ~/dev/my-project --name 'Project · Shell'
-gws new command --cwd ~/dev/my-project --name 'Project · Dev server' -- npm run dev
+gws codex               # new managed Codex tab in the current directory
+gws codex ~/dev/my-project --name 'Project · Codex'
+gws claude --cwd ~/dev/my-project --name 'Project · Claude'
+gws shell --cwd ~/dev/my-project --name 'Project · Shell'
+gws command --cwd ~/dev/my-project --name 'Project · Dev server' -- npm run dev
 gws                    # dashboard in this terminal
 gws launch             # dashboard in its own Ghostty window
 ```
+
+A project directory can be positional (`gws codex ~/dev/project`) or passed with `--cwd` / `-C`. Relative paths are resolved from the directory where you invoke `gws`. Supplying both forms is rejected. `resume` and Codex `fork` are accepted directly, including their provider options. Other agent options go after `--`, for example `gws codex . -- --model MODEL`. The original `gws new codex` spelling remains supported.
 
 For Codex, use `/hooks` to review and trust the scoped `gws` hooks if the CLI requests it. These hooks only record session identity and subagent lifecycle metadata. They do not read prompts or return instructions to the model. Hook trust and normal agent permissions are left to the agent's standard controls.
 
@@ -64,13 +67,16 @@ Imported tabs gain process tracking when relaunched through `gws`. Until then th
 ### Agent options and custom commands
 
 ```sh
-gws new codex --workspace research --cwd ~/dev/project -- --model MODEL
-gws new codex --cwd ~/dev/project --session CONVERSATION_UUID
-gws new claude --cwd ~/dev/project --session CONVERSATION_UUID
-gws new codex --cwd ~/dev/project --isolated
+gws codex --workspace research --cwd ~/dev/project -- --model MODEL
+gws codex --cwd ~/dev/project --session CONVERSATION_UUID
+gws claude --cwd ~/dev/project --session CONVERSATION_UUID
+gws codex --cwd ~/dev/project --no-daemon
+gws codex --cwd ~/dev/project resume CONVERSATION_UUID --no-daemon
+gws codex resume --last
+gws claude --cwd ~/dev/project resume CONVERSATION_UUID
 ```
 
-Codex uses its normal shared server by default. `--isolated` adds `--no-daemon`, which gives the tab a private process tree that can be measured more completely, at the cost of a separate server per tab. Other CLIs can be added as explicit command tabs. A command is stored as an executable plus argument list, not an inferred command from a tab title. Such commands restart; arbitrary processes and in-memory state cannot survive a reboot.
+Codex uses its normal shared server by default. `--no-daemon` (also accepted as `--isolated`) opts into a private server, which gives the tab a private process tree that can be measured more completely, at the cost of a separate server per tab. Other CLIs can be added as explicit command tabs. A command is stored as an executable plus argument list, not an inferred command from a tab title. Such commands restart; arbitrary processes and in-memory state cannot survive a reboot.
 
 ## Dashboard
 
@@ -92,7 +98,7 @@ Codex uses its normal shared server by default. `--isolated` adds `--no-daemon`,
 - **RSS:** summed process resident bytes, expressed in MiB. Shared pages can be counted more than once; this is not Activity Monitor's memory footprint or system memory pressure.
 - **Processes:** current descendants of a verified launcher PID. Detached, reparented, remote, and shared-daemon processes are excluded. A descendant that exits between samples may never appear.
 - **Subagents:** logical agent IDs observed through `SubagentStart` / `SubagentStop`, shown separately from process count. A subagent is not necessarily an OS process. Counts describe lifecycle events observed during the current launch; missing hooks or unexpected agent shutdown can leave them incomplete. They are unavailable until hooks have run.
-- **Shared Codex server:** its memory, tools, and subprocesses are not assigned to individual tabs. Counting the whole shared server once per tab would inflate totals. Use `--isolated` when you need attributable process trees.
+- **Shared Codex server:** its memory, tools, and subprocesses are not assigned to individual tabs. Counting the whole shared server once per tab would inflate totals. Use `--no-daemon` when you need attributable process trees. It is opt-in.
 - **Ghostty itself:** shared renderer/app memory is not assigned to tabs.
 
 The dashboard samples processes and tab metadata approximately every two seconds on a worker thread. Input remains independent of sampling. Agent transcripts and conversation content stay in their own tools; `gws` stores IDs and launch metadata only.
