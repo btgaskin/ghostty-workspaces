@@ -1,6 +1,6 @@
 [package]
 name = "ghostty-workspaces"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Native Ghostty workspaces, agent session continuity, and process monitoring"
@@ -20,8 +20,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+libc = "0.2"
+signal-hook = "0.4"
 
-[dev-dependencies]
 tempfile = "3"
 
 [profile.release]

@@ -1,57 +1,57 @@
 # Architecture
 
-## Integration boundary
+## Identity and integration
 
-Use Ghostty's native macOS AppleScript interface for surface inventory, working directories, creating windows and tabs, focus, and close. A surface runs `gws run <entry-id> <run-token>`. The launcher records its own PID and process start time, then waits for the shell or CLI child. The dashboard reads state and samples processes independently. The launcher has no sampling loop.
+A workspace groups stable work items. A work item owns its saved directory, provider/profile, exact conversation binding and deliberate service relationships. Every execution gets a distinct boot-bound run token. Native Ghostty surfaces are presentation, not durable identity.
 
-This keeps the terminal's renderer, native tabs, keyboard behavior, and selection owned by Ghostty. It avoids an app fork, extra renderer, nested terminal protocol, socket server, and a permanently installed agent service. macOS is the initial platform because Ghostty's native automation API currently lives there.
+Ghostty owns tabs, rendering, keyboard behavior and selection. Public AppleScript inventory/open/focus/close avoids a fork or nested terminal. No public process-ID or split-tree contract is assumed. Existing binding requires reciprocal unique process signatures; ambiguity remains visible.
 
-## Durable and live identity
+Codex's runtime hook session ID is not assumed to be its durable thread ID. A bounded root `session_meta` transcript record provides that identity. Claude lifecycle hooks provide its session ID and transcript path. Cursor uses its exact public CLI chat ID; its private database is not decoded. Generic CLIs get executable/argv/cwd restart semantics.
 
-A saved entry has a stable UUID, workspace, ordered window group, label, absolute working directory, provider, provider session UUID, and launch arguments. A run has a new token, PID, start time, observed logical agents, and live surface ID. Runtime identity is never treated as durable conversation identity. A title UUID is an unverified candidate until live root metadata, a lifecycle hook, or an explicit bind verifies it.
+Scoped hooks include work/run identities explicitly, reject stale tokens and keep logical agent counts separate from OS descendants. Hook activity is advisory. Shared Codex servers and external helper relationships cannot be allocated to individual tabs from ancestry alone.
 
-For imported Codex tabs, one-shot discovery joins native process ancestry (including root-owned login bridges), cwd, and the launch signature from the Ghostty title. Only reciprocal unique matches are adopted. Open root CLI session metadata provides exact IDs; subagent and oversized metadata are rejected. An adopted PID/start-time pair provides ownership without restarting the tab. Identical signatures, multiple root logs, and unavailable metadata remain explicit. Discovery runs on save/bind, not each dashboard frame.
+## Ownership before execution
 
-Every hook command includes its entry and run token explicitly, rather than depending on environment variables forwarded by a shared agent daemon. Late hooks from an older run cannot change the current entry. File locking serializes concurrent hook writes. Sessions are written as soon as metadata is available, rather than waiting for graceful shutdown.
+A one-use launch authorization checks work binding, directory, survivors and per-item leases. Required services must still have the exact checked live run and cannot be reserved by another operation. Dependency readiness is checked before the final transactional identity validation, including direct opens and standby resumes.
 
-Codex hook `session_id` can represent runtime session identity. The adapter reads only the first bounded metadata line of `transcript_path` and persists the root `session_meta.payload.id` UUID. A child/subagent transcript cannot replace the parent conversation. Missing or changed formats leave the entry unresolved. Claude's `SessionStart.session_id` provides its resume UUID directly. Both adapters receive per-launch lifecycle hooks through normal CLI configuration. They do not edit global provider configuration, overwrite notifications, or bypass hook trust.
+The supervisor starts a gate process in its own group. The gate waits on an inherited pipe while its PID/start identity is committed. Only then is the foreground terminal handed over and execution released. Parent disappearance before release closes the pipe and aborts the gate without starting the provider. The same process subsequently execs the provider. A recorded live child blocks duplicate launch even after supervisor loss or an inconsistent ended flag.
 
-## Resource attribution
+The supervisor waits for its child, forwards termination to its owned group, records surviving members, and performs eligible run-service cleanup. It does not force-kill work. Provider control remains manual-only. Per-run private Unix sockets provide control; they are not a permanent global service or a network listener. Utility subprocesses have separate bounded/cancellable groups and are never used to supervise work.
 
-The process sampler uses sysinfo's native macOS process implementation. An entry owns the current descendant tree of its launcher, only if its PID and start time still match. Both are required because PIDs are reused. Memory is summed resident bytes. CPU is sampled CPU usage, summed across descendants.
+## Operations
 
-Shared services are outside this tree. Codex's shared app-server can run work for many terminal clients. Accurately splitting its RSS and CPU by logical conversation is not generally possible from OS process counters. The default preserves Codex's shared-server behavior. The optional isolated launch creates a private server and more complete ownership at the cost of separate server resources.
+One policy engine serves CLI, TUI and agent callers. Preview persists exact targets, expected revisions, bindings, run IDs, controller/exclusions, boot and expiry. Acceptance persists an operation before detached execution. Claiming an accepted operation revalidates boot/expiry, including recovery after an unstarted worker.
 
-Logical subagents are counted from lifecycle events, independently of OS children. They can share a process, or run elsewhere. Counts reset for a new launch. Unexpected failures or missed hooks can make lifecycle counts incomplete. Do not present them as independently verified running processes.
+Execution leases reserve selected items. Each step rechecks its contract and current dependant liveness. A selected dependant is not proof it stopped. Effects are saved before later terminal actions can fail. Retry reconciles an operation's exact recorded launch/stop, and refuses a different run. Completed effects are retained on cancellation or partial failure. Restore batches contain executions actually stopped rather than every planned target.
 
-## Performance
+Service recipes store explicit argv, owner, lifetime, stop recipe, readiness and dependencies. Registration does not start a service. Explicit adoption requires current-user PID identity and a stop recipe; ancestry does not grant external group ownership. Run-scoped cleanup is tied to the owning run token. There is no restart scheduler.
 
-The dashboard's worker reads tab metadata and samples process counters roughly once every two seconds. The main thread polls keyboard input and draws at most four times per second. Owned process trees are cached once per sample. Optional hardware collectors normalize macmon 0.6/0.8 pipe schemas, keep bounded histories, and mark samples stale after five seconds. Collector processes are stopped and reaped on normal dashboard exit. Optional SSH uses existing configuration with batch authentication and strict known-host checks; it has no default host or remote installation step. No conversation transcript scans, model requests, per-tab monitoring daemons, or listening network services run in the monitor. Codex metadata reads occur only for session-start events, with a bounded first-line read.
+## Storage and recovery
 
-Keep performance statements measured: release binary size, idle RSS/CPU, sampling duration, and input response on a stated machine and tab/process workload. A short idle sample is not a guarantee under heavy subprocess churn.
+SQLite holds work, current runs, run history and typed durable documents for plans/receipts/audits/caches. Read transactions provide one state snapshot. Full-synchronous writes and a shared file lock serialize hooks and operations. Reads do not create state directories.
 
-## Resource actions
+Legacy JSON is validated and backed up before import. UUIDs survive. Empty version-0 initialization can be retried. A completed import fences old binaries with a version-2 JSON marker. If legacy JSON changed after an interrupted import, both versions are preserved and use is refused until reconciliation; the database does not silently replace later legacy changes. Malformed and future schemas are refused.
 
-Closing a managed terminal keeps its saved entry. Later restoration invokes the provider's exact resume command. Closing a terminal can interrupt its foreground process; unsaved process state is not reconstructed. Shared or detached services may remain running. v0.1 delegates close behavior to Ghostty and does not send arbitrary process signals, purge memory, change priorities, or terminate shared servers.
+History retains older executions when current runs change or work is forgotten. Provider conversation logs remain authoritative and are not rewritten or deleted by `gws`.
 
-See [resource optimization](resource-optimization.md) for the reviewed suspend/park/priority options. Suspension and automatic eviction are not implemented.
+## Sampling, search and profiling
 
-## Next steps
+A worker samples processes/memory about every two seconds, Ghostty surfaces every five seconds, optional macmon every second, and conversation metadata every thirty seconds while History is visible. Unchanged bounded headers are cached by file size/mtime. The input thread uses cached liveness and redraws only on changes or input. Collector processes and reader threads are stopped/reaped/joined together.
 
-1. Broaden existing-session adapters with versioned provider APIs and explicit choices for ambiguous tabs; avoid automatic cwd/latest matching.
-2. Shared-server visibility as one service row, with logical client links and independently sampled service metrics.
-3. Better lifecycle health, last-hook timestamps, ended-versus-still-running subagent semantics, and provider version fixtures.
-4. User-authored resource budgets with advisory warnings before any automatic action.
-5. Save and restore split topology when Ghostty exposes a stable, queryable split-tree contract.
-6. Optional explicit login restore and launcher shortcuts, keeping one-shot restore separate from a permanent daemon.
+Fuzzy search retrieves local candidates. Explicit Jev reranking classifies at most 25 candidates against descriptive relevance levels. Each result retains fuzzy position, relevance, confidence, distribution and resolved model. Remaining matches retain pagination. Low confidence keeps fuzzy order; failures preserve useful local results. No raw transcript or full absolute project path is sent to Jev.
 
-## Primary references
+`RelevanceClassifier` separates inference from retrieval and lifecycle policy. A future local backend can load once, atomically swap model instances, preserve revisions for in-flight responses and unload during profiling. This release implements the cloud Jev backend; no resident model service is installed.
+
+Descriptions use bounded user/assistant excerpts and one ephemeral Luna medium run on request. Source fingerprint/conversation/model/time survive; generated prose cannot establish activity or authority. Temporary model jobs are registered, refused during pause, cancelled when pause begins, and accounted for before reporting profiling acknowledgement.
+
+Profiling preparation saves an audit, closes eligible parked surfaces, records actual stopped runs and freezes collectors. Its result covers managed work/monitoring. Unmanaged apps, system services and shared daemons may remain active. No “whole machine quiet” claim follows from a successful managed batch.
+
+## References
 
 - [Ghostty AppleScript](https://ghostty.org/docs/features/applescript)
-- [Ghostty window restoration](https://ghostty.org/docs/config/reference#window-save-state)
-- [Codex lifecycle hooks](https://learn.chatgpt.com/docs/hooks)
-- [Codex CLI](https://learn.chatgpt.com/docs/codex/cli)
-- [Claude Code CLI](https://code.claude.com/docs/en/cli-reference)
+- [Codex hooks](https://learn.chatgpt.com/docs/hooks)
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- [sysinfo](https://docs.rs/sysinfo/0.38.4/sysinfo/)
-- [Ratatui](https://docs.rs/ratatui/0.30.2/ratatui/)
+- [Cursor CLI](https://prod.cursor.com/docs/cli/overview)
+- [Jev API and confidence](https://docs.typesafe.ai/api)
+- [Apple memory pressure](https://support.apple.com/guide/activity-monitor/view-memory-usage-actmntr1004/mac)
+- [macmon](https://github.com/vladkens/macmon)

@@ -1,137 +1,170 @@
 # Ghostty Workspaces
 
-**Native Ghostty tabs. Exact agent sessions. A small resource dashboard.**
+**Manage work, keep exact conversation identities, and see what is consuming resources.**
 
-`gws` saves a set of terminal tabs and restores them after restarting your Mac. A Rust TUI shows tab ownership, local processes, observed logical subagents, and machine sensors. Codex, Claude Code, shells, and explicit commands can share a workspace.
+`gws` is a small Rust terminal dashboard for macOS and Ghostty 1.3+. It uses native Ghostty tabs and public AppleScript automation. No Ghostty fork, terminal multiplexer, web server, login item, or permanent global daemon.
 
-Early release for **macOS and Ghostty 1.3+**. Uses Ghostty's public AppleScript API. No Ghostty fork, terminal multiplexer, web server, or permanent background daemon.
-
-## Install
-
-Requires Rust and an installed Ghostty app.
+## Install and launch
 
 ```sh
 git clone https://github.com/btgaskin/ghostty-workspaces.git
 cd ghostty-workspaces
 cargo install --locked --path .
 gws doctor
+
+gws codex                       # current directory
+gws claude ~/dev/project
+gws cursor -C ~/dev/project
+gws shell ~/dev/project
+gws command ~/dev/project -- npm run dev
+gws                             # dashboard here
+gws launch                      # dashboard in a native Ghostty window
 ```
 
-macOS may ask your launching terminal for permission to automate Ghostty. Agent executables are found on `PATH`, in `~/.local/bin`, and in the common Homebrew bin directories. Existing Ghostty and agent configuration files are not edited.
-
-For Apple Silicon E/P CPU, GPU, power, and temperature panels, install the optional [macmon](https://github.com/vladkens/macmon) sampler with `brew install macmon`. Tab management and process monitoring work without it; local RAM falls back to the OS sample. An installed sampler runs only while the dashboard is open.
-
-## Start using it
-
-Create tabs through `gws` for reliable process ownership and automatic session capture:
+Use a positional directory or `--cwd` / `-C`. Provider options go after `--`; provider `resume` and Codex `fork` subcommands also work. `gws new codex` remains compatible.
 
 ```sh
-gws codex               # new managed Codex tab in the current directory
-gws codex ~/dev/my-project --name 'Project · Codex'
-gws claude --cwd ~/dev/my-project --name 'Project · Claude'
-gws shell --cwd ~/dev/my-project --name 'Project · Shell'
-gws command --cwd ~/dev/my-project --name 'Project · Dev server' -- npm run dev
-gws                    # dashboard in this terminal
-gws launch             # dashboard in its own Ghostty window
+gws codex ~/dev/project -- --model MODEL
+gws codex -C ~/dev/project resume CONVERSATION_UUID
+gws claude -C ~/dev/project resume CONVERSATION_UUID
+gws cursor -C ~/dev/project --conversation CHAT_ID
+gws codex --no-daemon            # explicitly opt into a private Codex server
 ```
 
-A project directory can be positional (`gws codex ~/dev/project`) or passed with `--cwd` / `-C`. Relative paths are resolved from the directory where you invoke `gws`. Supplying both forms is rejected. `resume` and Codex `fork` are accepted directly, including their provider options. Other agent options go after `--`, for example `gws codex . -- --model MODEL`. The original `gws new codex` spelling remains supported.
+Codex's shared server remains the default. `--no-daemon` is opt-in and does not establish safe automated shutdown. Normal provider permissions and hook trust remain in place. Review scoped Codex hooks in `/hooks` if requested; `gws` does not accept that trust prompt for you.
 
-For Codex, use `/hooks` to review and trust the scoped `gws` hooks if the CLI requests it. These hooks only record session identity and subagent lifecycle metadata. They do not read prompts or return instructions to the model. Hook trust and normal agent permissions are left to the agent's standard controls.
+Optional [macmon](https://github.com/vladkens/macmon) supplies Apple Silicon E/P CPU, GPU, temperature and power (`brew install macmon`). Process and memory monitoring work without it. Hardware collectors exist only while requested.
 
-After a reboot:
+## Continuity and existing tabs
 
-```sh
-gws restore            # default workspace
-gws restore research   # a named workspace
-gws restore --dry-run
-gws list
-```
-
-Managed tabs are saved when created; session IDs are recorded as lifecycle hooks arrive. No save-on-shutdown process is required. Restoring also works after closing a managed tab. Already-open tabs are skipped, and live launchers are checked using both PID and process start time to avoid duplicate launches.
-
-### Bring existing tabs into a workspace
+Managed work is saved immediately, independently of shutdown. A stable work ID holds its directory, provider home, exact conversation ID, options and dependencies. Each execution has a separate run identity and durable history.
 
 ```sh
-gws save
-gws save research
-```
-
-This records the current windows, tab order, and directories without interrupting agents. Inactive saved entries are retained; use `gws forget` to remove them. The dashboard itself is excluded.
-
-For existing Codex tabs, `save` attempts a one-to-one match using Ghostty process ancestry, cwd, and the launch flags/explicit target in the tab title. A unique match gains CPU/RSS tracking immediately. A currently open root CLI metadata file supplies its exact resume UUID. Only its first bounded metadata line is read; subagent logs are rejected. Ambiguous tab/process matches and multiple root files remain unresolved. This adapter depends on the installed CLI's file/process behavior, so it can fail closed on other versions.
-
-A UUID in a shell-generated title is an **unverified candidate**: it can describe the original `resume` target, while the CLI persists continued work under another ID. Candidates are refused when restoring or parking until verified. No latest-file/cwd heuristic assigns conversations. Preview automatic bindings, then walk through remaining tabs or bind an exact ID explicitly:
-
-```sh
-gws list
+gws save                        # record current Ghostty surfaces
 gws bind --auto --dry-run
 gws bind --auto
-gws bind --all          # automatic matches first; then UUID/skip prompts
-gws bind <saved-tab-id> <conversation-id>
+gws bind SAVED_WORK_ID CONVERSATION_ID
+gws list --json
+gws inspect SAVED_WORK_ID --json
 ```
 
-Imported tabs without a unique process match show unavailable ownership metrics; all local processes and machine sensors are still visible. Adoption is a snapshot, not lifecycle-hook attachment to an already-running provider. Run `gws save` again after changing an adopted conversation. Relaunching through `gws` adds ongoing session/subagent hooks. An unresolved agent tab is skipped during restoration, with a nonzero exit status. `gws` will not silently start a fresh conversation.
+Existing Codex discovery requires reciprocal unique process/cwd/launch matches and a bounded root transcript metadata record. Titles alone are unverified. Ambiguous matches stay unresolved; identical tabs are never assigned by order or newest file. Imported processes have conservative control capabilities. Existing Claude/Cursor sessions can be bound explicitly. Provider hooks do not attach retroactively.
 
-### Agent options and custom commands
+After reboot, opening `gws` shows the register without launching all saved work:
 
 ```sh
-gws codex --workspace research --cwd ~/dev/project -- --model MODEL
-gws codex --cwd ~/dev/project --session CONVERSATION_UUID
-gws claude --cwd ~/dev/project --session CONVERSATION_UUID
-gws codex --cwd ~/dev/project --no-daemon
-gws codex --cwd ~/dev/project resume CONVERSATION_UUID --no-daemon
-gws codex resume --last
-gws claude --cwd ~/dev/project resume CONVERSATION_UUID
+gws restore --preview           # returns a plan ID; no providers start
+gws apply PLAN_ID --wait         # execute the exact reviewed plan
+gws open SAVED_WORK_ID           # focus or explicitly resume one item
 ```
 
-Codex uses its normal shared server by default. `--no-daemon` (also accepted as `--isolated`) opts into a private server, which gives the tab a private process tree that can be measured more completely, at the cost of a separate server per tab. Other CLIs can be added as explicit command tabs. A command is stored as an executable plus argument list, not an inferred command from a tab title. Such commands restart; arbitrary processes and in-memory state cannot survive a reboot.
+Missing directories, unresolved identities, live executions, changed dependencies and surviving owned processes prevent unsafe relaunches. Shells and generic commands restart; their in-memory state is not restored. Split geometry, scrollback and pixel positions are not recreated.
+
+| Provider | Continuity | Transcript / subagent coverage |
+| --- | --- | --- |
+| Codex | Exact durable root conversation ID, provider home and cwd | JSONL; scoped lifecycle hooks; shared-server resource attribution remains partial |
+| Claude Code | Exact session ID and cwd | JSONL when hook path is available; scoped lifecycle hooks |
+| Cursor CLI | Exact chat ID via `create-chat` / `--resume` | Private transcript format is not decoded; explicit JSONL exports may be supplied. No scoped hook or subagent coverage. Rebind after changing chats with `/clear` or `/fork`. |
+| Shell / arbitrary CLI | Saved executable, arguments and cwd | Restart only; provider-specific continuation requires an adapter |
+
+## History, descriptions and search
+
+```sh
+gws history --item SAVED_WORK_ID --json
+gws sessions --query 'memory pressure'
+gws describe SAVED_WORK_ID       # on request: Codex Luna, medium reasoning
+gws describe SAVED_WORK_ID --transcript /path/to/export.jsonl
+```
+
+The conversation catalog finds root Codex history across folders, including archived metadata, and registered Claude/Cursor conversations. Subagent logs are excluded from root results. Unchanged metadata headers are cached while the dashboard runs. `gws history` retains run outcomes even after a later execution or forgetting saved work.
+
+Descriptions record purpose, last evidenced progress, blocker and next step, with source fingerprint, conversation, model and timestamp. Only bounded user/assistant text is used; tool outputs, images, system messages and environment instructions are excluded. These generated descriptions are advisory and never prove that a run is idle or authorize cleanup. They use an ephemeral headless Codex run with project configuration and tools disabled. Model generation is never automatic.
+
+### Optional Jev reranking
+
+```sh
+gws search-config --env-file /private/path/to/.env --min-confidence 0.6
+gws search --query 'memory pressure' --semantic --json
+```
+
+Alternatively set `TYPESAFE_API_KEY`, `JEV_KEY`, or `GWS_JEV_ENV_FILE`. Configuration stores the credential file path, never the key. The file is parsed as data; it is never executed or sourced.
+
+Fuzzy retrieval stays local and immediate. An explicit semantic search sends at most 25 fuzzy candidates to the [official Jev API](https://docs.typesafe.ai/api), using names, project basenames and cached descriptions. Raw transcripts and full absolute project paths are excluded. Jev returns relevance, its probability distribution and confidence. Confident relevant candidates move ahead; uncertain candidates retain fuzzy order; confidently unrelated candidates follow. Remaining fuzzy results stay available. Failures retain local results with an explicit error. Responses are cached for ten minutes, with at most 128 entries.
+
+The default confidence threshold is an adjustable policy, not a calibrated accuracy claim. The replaceable `RelevanceClassifier` interface retains backend/model revision for each response. A resident, hot-loaded local classifier is a future backend; no model is loaded per keystroke or kept resident by this release.
 
 ## Dashboard
 
-Wide terminals place the tab/process list at the upper left, selected details below, and hardware monitors on the right. Narrow terminals stack the panels. Machine RAM, swap, E/P CPU frequency/load, GPU frequency/load, temperature, and power are independent of tab bindings. Larger panels include up to 60 samples of history.
+Wide screens put the work list above selected details on the left, with memory and hardware panels on the right. Medium screens stack list/details with a compact machine summary. Narrow screens keep the list and offer a dedicated details view. Native terminal colors are the default; `--theme dark` uses a restrained mint palette, and `--theme mono` / `--ascii` support simpler terminals.
+
+![Wide terminal dashboard](docs/images/dashboard.png)
+
+*Illustration rendered from synthetic work and machine readings.*
 
 | Key | Action |
 | --- | --- |
-| Tab | Switch between saved tabs and all local OS processes |
-| `j` / `k`, arrows | Select a row |
-| Page Up / Page Down | Scroll selected details |
-| Enter | Focus an open tab or resume a saved tab |
-| `p`, then `y` | Close the selected terminal through Ghostty; retain its saved session |
-| `s` | Save the current Ghostty layout to `default` |
-| `r` | Restore the selected tab's workspace |
-| `m` / `c` / `w` | Sort by resident memory, CPU, or workspace |
-| `q` / Escape | Quit the dashboard |
+| Tab | Saved work / conversation History / Mac executable groups |
+| `/` | Fuzzy search names, paths, identities and cached descriptions |
+| `J` | Explicit Jev rerank of History search; fuzzy results remain usable |
+| Arrows / `j` / `k` | Select |
+| Enter | Focus/resume saved work, or inspect a history/process row |
+| `o` | Register and open a selected historical conversation |
+| `b` | Generate a selected saved conversation's description |
+| `d`, `h`, `t` | Details / hardware view / technical identity details |
+| Page Up / Page Down | Scroll details, plans and receipts |
+| `p`, `f`, `r` | Preview park / finish / workspace restore |
+| `Q` | Preview profiling preparation |
+| `y` / Escape | Apply exact displayed plan / return or cancel preview |
+| `M` | Pause / explicitly resume monitoring |
+| `m`, `c`, `v` | Memory / CPU sort; Mac groups versus individual processes |
+| `s` | Save current Ghostty surfaces |
+| `q` | Exit dashboard |
 
-Remote sensors are completely opt-in: `gws --ssh user@host` or `gws launch --ssh user@host`. The default contacts no other machine. SSH uses existing credentials/routing, batch authentication, and strict known-host verification; `macmon` must already be installed remotely. Large screens split the monitor column between devices; `h` cycles devices when space is limited. Remote panels contain hardware sensors, not remote tab management or process ownership. Stale/disconnected streams are explicit. Nothing is installed remotely. Remote-device acceptance remains experimental.
+`--ssh user@host` remains completely optional and uses existing SSH credentials, strict known-host checks and a remotely installed macmon. Default operation contacts no remote device. Remote process control is outside the core; device-panel layout is experimental.
 
-`gws sensors` prints a bounded live hardware snapshot as JSON and exits, stopping its collectors.
+## Parking, cleanup and profiling
 
-`gws open`, `gws focus`, and `gws park` also accept a saved tab ID. `gws forget` removes a saved entry without closing its terminal or deleting agent history. `gws list --json` exposes the local inventory and owned metrics for other tools.
+A hidden or suspended tab still retains memory. To reclaim a provider's allocations, finish or cancel through its own UI, then exit the CLI. Managed terminals retain a cheap standby placeholder, with exact Resume and Details actions.
 
-## What the numbers mean
+```sh
+gws park SAVED_WORK_ID --preview
+gws apply PLAN_ID --wait
+gws quiet --preview             # eligible managed work; closes parked tabs by default
+gws apply PLAN_ID --wait
+gws operation PLAN_ID --json
+gws restore --batch BATCH_ID --preview
+gws monitoring resume
+```
 
-- **CPU:** sum of observed CPU usage for the launcher and its current descendants. 100% is one CPU core; multicore work can exceed 100%.
-- **RSS:** summed process resident bytes, expressed in MiB. Shared pages can be counted more than once; this is not Activity Monitor's memory footprint or system memory pressure.
-- **Processes:** current descendants of a verified launcher PID. Detached, reparented, remote, and shared-daemon processes are excluded. A descendant that exits between samples may never appear.
-- **Subagents:** logical agent IDs observed through `SubagentStart` / `SubagentStop`, shown separately from process count. A subagent is not necessarily an OS process. Counts describe lifecycle events observed during the current launch; missing hooks or unexpected agent shutdown can leave them incomplete. They are unavailable until hooks have run.
-- **Shared Codex server:** its memory, tools, and subprocesses are not assigned to individual tabs. Counting the whole shared server once per tab would inflate totals. Use `--no-daemon` when you need attributable process trees. It is opt-in.
-- **Ghostty itself:** shared renderer/app memory is not assigned to tabs.
-- **Machine CPU/GPU:** macmon 0.8 active ratios are labeled `active`; older `[MHz, ratio]` samples are labeled `weighted`. Frequency-weighted utilization differs from active time. RAM is machine usage, not summed tab RSS or memory pressure.
+Running Codex/Claude/Cursor sessions are **manual-only**. Busy or unknown activity is never treated as permission to stop them. Registered services have explicit shutdown contracts and run/work/persistent lifetimes; run-scoped services are cleaned up after their owning run exits. Persistent services are excluded from default profiling preparation. See [service registration and agent commands](docs/agent-guide.md).
 
-The dashboard samples processes and tab metadata approximately every two seconds on a worker thread, caching owned trees once per sample. One optional macmon stream per device samples approximately once per second. Input remains independent of sampling. Agent transcripts and conversation content stay in their own tools; `gws` stores IDs and launch metadata only.
+Plans expire, belong to one boot, protect the controller and exclusions, reserve exact items, and revalidate revisions/run identities before effects. Operations retain partial outcomes and actually stopped runs. Reapplying returns the receipt; explicit retries reconcile the same run and do not broaden scope. Cancellation prevents later steps; it does not undo completed effects.
 
-For resource actions, `p` parks a verified session. Suspension is a separate future action: stopping processes reduces CPU work but retains allocations. See [resource optimization](docs/resource-optimization.md) for reviewed options; no automatic suspension or eviction is enabled.
+Profiling preparation records a final audit, stops and joins dashboard collectors, cancels temporary model jobs and freezes monitoring. An acknowledgement reports the `gws` scope. Other apps, shared daemons and system services may remain active; successful managed preparation does not establish a globally quiet Mac.
 
-## Storage and limitations
+## Resource accounting and diagnostics
 
-State lives in `~/.local/share/ghostty-workspaces/workspaces.json`. Override with `GWS_STATE_DIR` or `--state-dir`. Writes use a file lock, an atomic rename, and a synced file and directory. Malformed or newer-format state is not overwritten. The directory is private to your user. Local state contains project paths, tab names, launch arguments, and conversation IDs; keep it out of public repositories and avoid secrets in command arguments.
+- CPU is expressed as percent of one core; aggregate work can exceed 100%.
+- Owned process trees require PID and start identity, with a recorded child fallback after supervisor loss. Reparented/shared workloads remain separately visible.
+- Summed RSS can count shared pages repeatedly. Charged footprint includes compressed accounting where available; neither forms an additive partition of physical RAM.
+- Memory pressure, compressed memory and swap rates distinguish current pressure from an old swap total. Unavailable counters are shown explicitly.
+- Subagent counts describe observed logical lifecycle events, not OS children. Missing hooks mean unavailable, not zero.
+- Mac groups use executable names, with verified per-process ownership where available. Age, repetition and suspended state are review cues, never cleanup permission.
 
-v0.1 restores window groups and tab order when recreating a workspace from closed tabs. It does not recreate split geometry, pixel positions, terminal scrollback, remote machine state, or arbitrary live process memory. Existing split surfaces are imported as separate tabs. Shells restart at their saved directory. Agent resume relies on the agent's own persisted history and normal authentication. Conversation histories are not copied, compacted, translated, or rewritten.
+```sh
+gws audit --save --json
+gws diagnostic files --pid PID --json
+gws diagnostic startup --json
+gws diagnostic sleep --json
+```
 
-Ghostty's own macOS window restoration can coexist with `gws`: live terminal IDs are used to avoid reopening the same saved surface. Automatically reopened bare shells or changed surface IDs may require a deliberate `gws restore` and closing redundant shells. v0.1 does not install a login item or alter global Ghostty window-restoration settings.
+These are bounded, on-request inspections. No weekly scheduler, arbitrary process killing, launch-registration removal or `fseventsd` diagnosis runs automatically. See [resource optimization](docs/resource-optimization.md).
 
-## Development
+## Storage and development
+
+Private state defaults to `~/.local/share/ghostty-workspaces/`; override with `GWS_STATE_DIR` or `--state-dir`. SQLite transactions, a shared file lock and synced writes store work, runs, history, plans, receipts and caches. v0.1 JSON imports retain UUIDs and an original `workspaces.v1.backup.json`. A version-2 JSON marker fences old writers. Interrupted empty initialization is recoverable; changed legacy state after import is preserved and refused for reconciliation. Malformed and newer schemas are never overwritten.
+
+State includes private paths, launch options, summaries and search cache. Keep it out of public repositories and avoid credentials in command arguments. Provider histories remain owned by their providers.
 
 ```sh
 cargo fmt --check
@@ -140,8 +173,6 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Tests cover exact conversation identity, stale hook rejection, concurrent subagent events, process-tree ownership, PID reuse, malformed-state preservation, and compact terminal rendering. Live macOS automation needs Ghostty running and normal Automation permission. CI cannot prove behavior across a physical reboot or live agent-provider requests.
+See [architecture](docs/architecture.md) and [validation](docs/validation.md). Physical reboot, real provider continuation across reboot, and optional remote-device acceptance are separate from fixture tests.
 
-See [architecture](docs/architecture.md) for the integration boundaries and next steps.
-
-MIT licensed. Independent project; not affiliated with Ghostty, OpenAI, or Anthropic.
+MIT licensed. Independent of Ghostty, OpenAI, Anthropic and Cursor. [macmon](https://github.com/vladkens/macmon) (MIT, Vlad Kens) inspired the quiet hardware presentation; its sampler is optional and no UI code was copied.

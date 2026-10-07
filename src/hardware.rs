@@ -164,6 +164,7 @@ pub fn remote_command(host: &str) -> Command {
 struct Collector {
     state: Arc<Mutex<Host>>,
     child: Option<Arc<Mutex<Child>>>,
+    readers: Vec<thread::JoinHandle<()>>,
 }
 impl Collector {
     fn spawn(label: String, command: Result<Command>) -> Self {
@@ -182,14 +183,18 @@ impl Collector {
             Ok(c) => c,
             Err(e) => {
                 state.lock().unwrap().error = Some(e.to_string());
-                return Self { state, child: None };
+                return Self {
+                    state,
+                    child: None,
+                    readers: vec![],
+                };
             }
         };
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let errors = Arc::new(Mutex::new(String::new()));
         let stderr_errors = errors.clone();
-        thread::spawn(move || {
+        let stderr_thread = thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
             let mut bytes = [0u8; 512];
             while let Ok(n) = reader.read(&mut bytes) {
@@ -207,7 +212,7 @@ impl Collector {
             }
         });
         let stream_state = state.clone();
-        thread::spawn(move || {
+        let stdout_thread = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
                 let mut line = Vec::new();
@@ -240,6 +245,7 @@ impl Collector {
         Self {
             state,
             child: Some(Arc::new(Mutex::new(child))),
+            readers: vec![stderr_thread, stdout_thread],
         }
     }
 }
@@ -249,6 +255,9 @@ impl Drop for Collector {
             let mut child = child.lock().unwrap();
             let _ = child.kill();
             let _ = child.wait();
+        }
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
         }
     }
 }

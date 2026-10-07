@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
+    io::{Read, Write},
     process::{Command, Stdio},
 };
 
@@ -34,7 +34,37 @@ pub fn jxa(source: &str) -> Result<String> {
         .take()
         .context("Cannot open AppleScript stdin")?
         .write_all(source.as_bytes())?;
-    let output = child.wait_with_output()?;
+    let start = std::time::Instant::now();
+    let stdout = child.stdout.take().context("Missing automation stdout")?;
+    let stderr = child.stderr.take().context("Missing automation stderr")?;
+    let drain = |stream: Box<dyn std::io::Read + Send>| {
+        let mut bytes = vec![];
+        let _ = stream.take(1024 * 1024).read_to_end(&mut bytes);
+        bytes
+    };
+    let out = std::thread::spawn(move || drain(Box::new(stdout)));
+    let err = std::thread::spawn(move || drain(Box::new(stderr)));
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        };
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    let Some(status) = status else {
+        bail!("Ghostty automation timed out after 5 seconds")
+    };
+    let output = std::process::Output {
+        status,
+        stdout,
+        stderr,
+    };
     if !output.status.success() {
         bail!(
             "Ghostty automation failed: {}",

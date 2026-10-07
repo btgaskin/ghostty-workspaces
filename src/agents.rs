@@ -1,24 +1,25 @@
 use crate::{
     ghostty::shell_quote,
-    model::{Agent, Entry, Run, Store},
-    process,
+    model::{Agent, Entry, Store},
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
     fs::File,
     io::{BufRead, BufReader, Read},
     path::Path,
     process::Command,
 };
 use uuid::Uuid;
-const EVENTS: [&str; 5] = [
+const EVENTS: [&str; 8] = [
     "SessionStart",
     "SessionEnd",
     "SubagentStart",
     "SubagentStop",
     "Stop",
+    "UserPromptSubmit",
+    "PermissionRequest",
+    "PreToolUse",
 ];
 
 pub fn hooks(store: &Store, entry: &Entry, token: Uuid) -> Result<Value> {
@@ -35,55 +36,10 @@ pub fn hooks(store: &Store, entry: &Entry, token: Uuid) -> Result<Value> {
         json!({"hooks":EVENTS.into_iter().map(|event|(event.to_owned(),json!([{ "hooks":[{"type":"command","command":command,"timeout":2}] }]))).collect::<serde_json::Map<String,Value>>()}),
     )
 }
-pub fn launch(store: &Store, id: Uuid, token: Uuid) -> Result<i32> {
-    let entry = store.read()?.entry(id)?.clone();
-    let pid = std::process::id();
-    let start = process::start_time(pid)
-        .context("Cannot read own process identity; process access is required")?;
-    store.update(|s| {
-        if let Some(run) = s.runs.get(&id)
-            && !run.ended
-            && process::start_time(run.pid) == Some(run.start_time)
-        {
-            bail!("This saved tab already has a running launcher")
-        }
-        s.runs.insert(
-            id,
-            Run {
-                token,
-                pid,
-                start_time: start,
-                terminal_id: entry.terminal_id.clone(),
-                ended: false,
-                hooks_seen: false,
-                agents: BTreeMap::new(),
-                agents_started: 0,
-                last_error: None,
-                exit_code: None,
-            },
-        );
-        let saved = s
-            .entries
-            .iter_mut()
-            .find(|e| e.id == id)
-            .context("Unknown tab")?;
-        saved.ever_started = true;
-        saved.imported = false;
-        Ok(())
-    })?;
-    let result = run_command(store, &entry, token);
-    store.update(|s| {
-        if let Some(r) = s.runs.get_mut(&id).filter(|r| r.token == token) {
-            r.ended = true;
-            r.agents.clear();
-            r.last_error = result.as_ref().err().map(|e| format!("{e:#}"));
-            r.exit_code = result.as_ref().ok().copied();
-        }
-        Ok(())
-    })?;
-    result
-}
-fn run_command(store: &Store, entry: &Entry, token: Uuid) -> Result<i32> {
+pub fn command(store: &Store, entry: &Entry, token: Uuid) -> Result<Command> {
+    if entry.ever_started && entry.session_verified && entry.resume_args.is_none() {
+        checked_resume_options(entry.agent, &entry.args)?;
+    }
     let hook_config = hooks(store, entry, token)?;
     let provider_args = provider_args(entry, token);
     let mut cmd = match entry.agent {
@@ -111,6 +67,85 @@ fn run_command(store: &Store, entry: &Entry, token: Uuid) -> Result<i32> {
             c.args(&provider_args);
             c
         }
+        Agent::Cursor => {
+            if entry.args.iter().any(|a| {
+                a == "--workspace"
+                    || a.starts_with("--workspace=")
+                    || a == "--worktree"
+                    || a.starts_with("--worktree=")
+                    || a == "-w"
+            }) {
+                bail!(
+                    "Use gws --cwd to pin the project directory; Cursor workspace/worktree overrides are not supported"
+                )
+            }
+            let program = executable("agent").or_else(|_| executable("cursor-agent"))?;
+            let mut id = entry
+                .provider_session
+                .clone()
+                .or_else(|| entry.session_id.map(|id| id.to_string()));
+            if id.is_none() {
+                for (i, arg) in entry.args.iter().enumerate() {
+                    if let Some(value) = arg.strip_prefix("--resume=") {
+                        id = Some(value.into());
+                    } else if arg == "--resume" {
+                        id = entry
+                            .args
+                            .get(i + 1)
+                            .filter(|s| !s.starts_with('-'))
+                            .cloned();
+                        if id.is_none() {
+                            bail!(
+                                "Cursor resume requires an exact chat ID; use gws cursor --conversation ID"
+                            )
+                        }
+                    } else if arg == "--continue" {
+                        bail!("Cursor --continue is ambiguous; use an exact conversation ID")
+                    }
+                }
+            }
+            if id.is_none() {
+                let mut create = Command::new(&program);
+                create
+                    .arg("create-chat")
+                    .current_dir(&entry.cwd)
+                    .env("PATH", launch_path()?);
+                let output = crate::util::output(create, std::time::Duration::from_secs(10))?;
+                if !output.status.success() {
+                    bail!("Cursor create-chat failed; no conversation was launched")
+                };
+                id = Some(String::from_utf8(output.stdout)?.trim().to_owned());
+            }
+            let id = id.context("Cursor conversation missing")?;
+            validate_cursor_id(&id)?;
+            store.update(|s| {
+                if s.runs.get(&entry.id).is_none_or(|r| r.token != token) {
+                    bail!("Cursor run changed before binding")
+                };
+                let e = s
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.id == entry.id)
+                    .context("Item missing")?;
+                e.provider_session = Some(id.clone());
+                e.session_verified = true;
+                e.resume_args = checked_resume_options(Agent::Cursor, &e.args).ok();
+                Ok(())
+            })?;
+            let mut c = Command::new(program);
+            c.args(["--resume", &id]);
+            let args = if entry.ever_started {
+                entry
+                    .resume_args
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| checked_resume_options(Agent::Cursor, &entry.args))?
+            } else {
+                cursor_initial_args(&entry.args)
+            };
+            c.args(args);
+            c
+        }
         Agent::Shell => {
             let mut c = Command::new(std::env::var_os("SHELL").unwrap_or("/bin/zsh".into()));
             c.arg("-l");
@@ -128,16 +163,33 @@ fn run_command(store: &Store, entry: &Entry, token: Uuid) -> Result<i32> {
     };
     cmd.current_dir(&entry.cwd);
     cmd.env("PATH", launch_path()?);
-    let status = cmd.status().with_context(|| {
-        format!(
-            "Could not launch {}. Check that it is on PATH.",
-            entry.agent
-        )
-    })?;
-    Ok(status.code().unwrap_or(1))
+    cmd.env("GWS_ITEM_ID", entry.id.to_string())
+        .env("GWS_RUN_ID", token.to_string());
+    if let Some(home) = &entry.provider_home {
+        cmd.env(
+            if entry.agent == Agent::Codex {
+                "CODEX_HOME"
+            } else {
+                "CLAUDE_CONFIG_DIR"
+            },
+            home,
+        );
+    }
+    Ok(cmd)
 }
+pub fn launch(store: &Store, id: Uuid, token: Uuid) -> Result<i32> {
+    crate::supervisor::launch(store, id, token)
+}
+
 pub fn provider_args(entry: &Entry, token: Uuid) -> Vec<String> {
-    let mut args = entry.args.clone();
+    let mut args = if entry.ever_started && entry.session_verified {
+        entry
+            .resume_args
+            .clone()
+            .unwrap_or_else(|| resume_options(entry.agent, &entry.args))
+    } else {
+        entry.args.clone()
+    };
     if let Some(id) = entry.session_id {
         let identity_command = match entry.agent {
             Agent::Codex => matches!(args.first().map(String::as_str), Some("resume" | "fork")),
@@ -171,6 +223,111 @@ pub fn provider_args(entry: &Entry, token: Uuid) -> Vec<String> {
     }
     args
 }
+/// Retain options and their values, discard launch-only positional prompts/selectors.
+/// Unknown options are refused on resume rather than guessing whether they consume a prompt.
+pub fn checked_resume_options(agent: Agent, args: &[String]) -> Result<Vec<String>> {
+    let value_flags = match agent {
+        Agent::Codex => vec![
+            "-c",
+            "--config",
+            "-m",
+            "--model",
+            "-p",
+            "--profile",
+            "-s",
+            "--sandbox",
+            "-a",
+            "--ask-for-approval",
+            "--add-dir",
+            "--enable",
+            "--disable",
+        ],
+        Agent::Claude => vec![
+            "--model",
+            "--permission-mode",
+            "--allowedTools",
+            "--disallowedTools",
+            "--add-dir",
+            "--mcp-config",
+            "--settings",
+            "--system-prompt",
+            "--append-system-prompt",
+            "--effort",
+        ],
+        Agent::Cursor => vec![
+            "--model",
+            "--mode",
+            "--sandbox",
+            "--add-dir",
+            "--plugin-dir",
+            "--output-format",
+            "--endpoint",
+            "-e",
+            "-H",
+            "--header",
+        ],
+        _ => vec![],
+    };
+    let switches = [
+        "--no-daemon",
+        "--no-alt-screen",
+        "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-skip-permissions",
+        "--verbose",
+        "--debug",
+        "--plan",
+        "--auto-review",
+        "--force",
+        "-f",
+        "--yolo",
+        "--trust",
+        "--approve-mcps",
+        "--print",
+        "-p",
+    ];
+    let mut out = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if matches!(
+            a.as_str(),
+            "resume" | "fork" | "--last" | "--all" | "--continue"
+        ) {
+            i += 1;
+            continue;
+        }
+        if matches!(
+            a.as_str(),
+            "--resume" | "-r" | "--session-id" | "-C" | "--cd"
+        ) {
+            i += 1;
+            if i < args.len() && !args[i].starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+        if value_flags.contains(&a.as_str()) {
+            out.push(a.clone());
+            i += 1;
+            out.push(args.get(i).context("Missing option value")?.clone());
+        } else if switches.contains(&a.as_str())
+            || value_flags
+                .iter()
+                .any(|flag| a.starts_with(&format!("{flag}=")))
+        {
+            out.push(a.clone());
+        } else if a.starts_with("--resume=") { /* consumed identity */
+        } else if a.starts_with('-') {
+            bail!("Unsupported resume option {a}; set explicit resume_args before resuming")
+        };
+        i += 1;
+    }
+    Ok(out)
+}
+pub fn resume_options(agent: Agent, args: &[String]) -> Vec<String> {
+    checked_resume_options(agent, args).unwrap_or_default()
+}
 fn launch_path() -> Result<std::ffi::OsString> {
     let mut dirs: Vec<_> =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
@@ -187,7 +344,7 @@ fn launch_path() -> Result<std::ffi::OsString> {
     }
     std::env::join_paths(dirs).context("Invalid launch PATH")
 }
-fn executable(name: &str) -> Result<std::path::PathBuf> {
+pub fn executable(name: &str) -> Result<std::path::PathBuf> {
     if name.contains('/') {
         return Ok(name.into());
     }
@@ -226,7 +383,14 @@ pub fn conversation_id(agent: Agent, input: &Value) -> Option<Uuid> {
 }
 pub fn hook(store: &Store, id: Uuid, token: Uuid, agent: Agent) -> Result<()> {
     let input: Value = serde_json::from_reader(std::io::stdin().take(256 * 1024))?;
-    apply_hook(store, id, token, agent, &input)
+    apply_hook(store, id, token, agent, &input)?;
+    if input["hook_event_name"] == "SessionStart" {
+        println!(
+            "{}",
+            json!({"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":format!("Managed by gws. For cleanup requests use --caller {}:{}; inspect and preview before apply. Never park this controlling run.",id,token)}})
+        );
+    }
+    Ok(())
 }
 pub fn apply_hook(store: &Store, id: Uuid, token: Uuid, agent: Agent, input: &Value) -> Result<()> {
     let event = input["hook_event_name"].as_str().unwrap_or("");
@@ -240,6 +404,15 @@ pub fn apply_hook(store: &Store, id: Uuid, token: Uuid, agent: Agent, input: &Va
             return Ok(());
         };
         run.hooks_seen = true;
+        run.activity_at = Some(crate::model::now());
+        run.activity_source = Some(format!("advisory_hook:{event}"));
+        // Hooks may be concurrent or dropped. Stop is not an idle guarantee.
+        run.activity = match event {
+            "UserPromptSubmit" | "PreToolUse" => "working",
+            "PermissionRequest" => "awaiting_input",
+            _ => "unknown",
+        }
+        .into();
         match event {
             "SessionStart" => {
                 // A new root conversation (including /clear) resets old logical agents.
@@ -252,6 +425,13 @@ pub fn apply_hook(store: &Store, id: Uuid, token: Uuid, agent: Agent, input: &Va
                 {
                     e.session_id = Some(conversation);
                     e.session_verified = true;
+                    if let Some(path) = input["transcript_path"].as_str() {
+                        let path = std::path::PathBuf::from(path);
+                        if path.is_absolute() {
+                            e.transcript_path = Some(path);
+                        }
+                    }
+                    e.resume_args = checked_resume_options(e.agent, &e.args).ok();
                 }
             }
             "SubagentStart" => {
@@ -286,11 +466,40 @@ pub fn session_from_title(title: &str) -> Option<Uuid> {
         .split_whitespace()
         .find_map(|s| Uuid::parse_str(s).ok())
 }
+pub fn validate_cursor_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 256
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+    {
+        bail!("Cursor conversation ID must contain only letters, digits, '-' or '_'")
+    };
+    Ok(())
+}
+fn cursor_initial_args(args: &[String]) -> Vec<String> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--resume" {
+            i += 2;
+            continue;
+        }
+        if args[i].starts_with("--resume=") {
+            i += 1;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Run, State};
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
     fn fixture() -> (tempfile::TempDir, Store, Uuid, Uuid) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(Some(dir.path().into())).unwrap();
@@ -313,6 +522,7 @@ mod tests {
                     terminal_id: None,
                     imported: false,
                     ever_started: true,
+                    ..Entry::default()
                 });
                 s.runs.insert(
                     id,
@@ -327,6 +537,7 @@ mod tests {
                         agents_started: 0,
                         last_error: None,
                         exit_code: None,
+                        ..Run::default()
                     },
                 );
                 Ok(())
@@ -402,7 +613,8 @@ mod tests {
     }
     #[test]
     fn malformed_store_is_not_overwritten() {
-        let (dir, s, _id, _token) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::new(Some(dir.path().into())).unwrap();
         let path = dir.path().join("workspaces.json");
         fs::write(&path, "broken").unwrap();
         assert!(

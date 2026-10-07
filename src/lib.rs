@@ -1,0 +1,14 @@
+pub mod agents;
+pub mod binding;
+pub mod catalog;
+pub mod descriptions;
+pub mod engine;
+pub mod ghostty;
+pub mod hardware;
+pub mod model;
+pub mod operations;
+pub mod process;
+pub mod search;
+pub mod supervisor;
+pub mod ui;
+pub mod util;

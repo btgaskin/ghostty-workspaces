@@ -1,31 +1,34 @@
 # Resource optimization
 
-Start with explicit parking of verified sessions. Add suspension separately after process ownership and recovery have been verified. Hiding a Ghostty tab does not stop its CLI or its tools.
+To reclaim memory, stop an eligible execution and retain its exact conversation/cwd. Hiding a terminal or suspending a process retains allocations. `gws` keeps durable work metadata and a cheap standby surface after normal provider exit; profiling preparation can close those surfaces too.
 
-| Action | CPU effect | Memory effect | Continuity | Status |
-| --- | --- | --- | --- | --- |
-| Leave an idle tab open | Provider-dependent background work continues | Allocations remain | Live process state | Available |
-| Park a verified session | Terminal-owned work normally exits | Exited processes release allocations; shared/detached services can remain | Exact provider session ID and cwd; reopen with `gws open` | Available through `gws park`, or `p` then `y` |
-| Suspend a private process group | Stopped processes cease execution | Allocations remain; RAM savings are not guaranteed | Same live processes on `SIGCONT`; connections and deadlines can expire meanwhile | Reviewed, not implemented |
-| Reduce background priority | Reduces competition for CPU under contention | Allocations remain | Processes keep running | Future option |
-| Automatically park idle sessions | Depends on correct idle/busy detection | Same boundary as manual parking | Requires verified durable identity | Future, opt-in only |
+| Action | CPU / memory | Continuity and policy |
+| --- | --- | --- |
+| Leave a run open | Background work and allocations remain | Same live processes |
+| Finish/cancel and exit provider | Exited private processes release allocations | Exact provider history; shared helpers may remain |
+| Stop a registered service | Owned group or explicit recipe stops; outcome verified | Recipe, lifetime and run outcome survive |
+| Profiling preparation | Eligible managed cleanup plus collector/model-job shutdown | Reviewed plan, partial receipts, actual restore batch |
+| Suspend | CPU can stop; allocations remain | Not implemented; insufficient for memory reclamation |
+| Automatic idle eviction | Requires reliable provider control/activity evidence | Not enabled; advisory hooks do not provide that contract |
 
-Apple's [signal documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sigaction.2.html) describes `SIGSTOP` and `SIGCONT`. Its [kill documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kill.2.html) distinguishes a process from a process group. Sending a stop signal to the TUI alone does not necessarily stop its server or children. Suspending the shared Codex server would affect other clients, so shared-server tabs must not be treated as independently suspendable workloads.
+## Read the right evidence
 
-## Local probe
+Memory pressure, compression, ongoing swap rate and responsiveness are more informative than swap total alone. The dashboard displays native counters where available and labels unavailable pressure explicitly. RSS, charged footprint and physical RAM have distinct accounting boundaries.
 
-On 2026-10-07, a task-owned Python worker allocated 128 MiB and ran a CPU loop. `ps` reported 139,472 KiB RSS before, during, and after suspension. CPU time stayed at 1.00 seconds over a one-second stop, then advanced to 1.70 seconds after continuation. The worker was terminated and reaped. No existing agent or user process was signalled. This verifies basic OS behavior on this machine; it does not validate pausing an active Codex/Claude request, GPU workload, or tool chain.
+Whole-Mac audit separates owned trees from executable-name groups of shared/unmanaged processes. Repeated MCP servers, long-lived dev servers, suspended jobs, detached helpers and costly terminal/editor/browser groups are useful review targets. Their age or name does not prove that they are unnecessary or safely stoppable.
 
-## Suspension requirements
+A short CPU sample cannot diagnose a persistent `fseventsd` loop. Use an OS diagnostic sample and controlled watcher comparisons under explicit authority. `gws` supplies bounded files/sockets, startup and sleep inspections; it does not automatically stop system services or alter other applications' settings.
 
-A future `suspend`/`continue` action should use an owned process group established by the launcher, with PID/start-time checks. It should show exactly which processes are affected, refuse shared-server/ambiguous ownership, and never infer a group from an arbitrary process row. Detached processes require separate accounting. The dashboard must remain outside the stopped group.
+## Profiling scope
 
-Suspension state and a recovery command must survive a dashboard crash. Continuation needs to work without launching a duplicate CLI. A parked or restored session must not inherit an obsolete suspended PID. Tests should cover nested children, group membership changes, stale PIDs, partial failures, dashboard exit, and foreground terminal behavior. Provider acceptance should include an idle session, an active network request, a long-running local tool, and normal shutdown after continuation.
+A successful quiet operation can establish which selected managed executions stopped and whether `gws` collectors/model jobs acknowledged shutdown. It does not establish a globally idle machine. Read the external audit groups and any refused steps before interpreting a profiling result.
 
-OS suspension does not establish that an agent is safely idle. For later automatic parking, use provider lifecycle state to distinguish idle, working, awaiting approval, and awaiting input. Prefer advisory memory-pressure/budget indicators first. CPU usage alone is insufficient: an idle-looking process can be waiting for a network request or a tool.
+The dashboard freezes cached data while paused; it performs no ongoing process/hardware sampling. New model jobs are refused and temporary in-flight jobs are cancelled/reaped. The shell or register can remain open without an active macmon stream. Restart monitoring explicitly when profiling ends.
 
-## Monitor overhead
+## Earlier OS suspension probe
 
-Owned process trees are calculated once per two-second process sample and reused during drawing and sorting. Hardware uses one optional macmon stream per explicitly selected device. No per-tab sampler or permanent `gws` daemon is installed. SSH is absent from the default path. Collectors are killed and reaped when the dashboard or one-shot sensor command exits normally.
+On 2026-10-07, a task-owned Python fixture allocated 128 MiB and ran a CPU loop. `ps` reported 139,472 KiB RSS before, during and after suspension. CPU time stayed at 1.00 seconds over a one-second stop, then advanced to 1.70 seconds after continuation. It was terminated and reaped. No user process was signalled. This earlier OS probe is not acceptance evidence for pausing a live Codex/Claude request, GPU workload or provider tool chain.
 
-Measure the complete monitor workload, including macmon and transient AppleScript processes, when comparing performance. Do not describe a main-process RSS measurement as total monitoring overhead. Memory pressure, swap growth, user-visible latency, and active tool workloads are more useful than a single utilization reading. Machine RAM, summed process RSS, and GPU load have different accounting boundaries; the dashboard labels these separately.
+## Measure the complete monitor
+
+Include the main dashboard, macmon and transient automation utilities when measuring overhead. Record release build, machine/workload, sampling interval and whether History is visible. A synthetic render, a short idle sample and a real profiling workload prove different things. Avoid attributing shared Codex servers or Ghostty renderer memory repeatedly to every tab.

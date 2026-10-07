@@ -16,16 +16,24 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use uuid::Uuid;
 
 pub fn one(store: &Store, id: Uuid, session: Uuid) -> Result<()> {
+    one_report(store, id, session, true)
+}
+pub fn one_report(store: &Store, id: Uuid, session: Uuid, report: bool) -> Result<()> {
     store.update(|s| {
         if !matches!(s.entry(id)?.agent, Agent::Codex | Agent::Claude) {
             bail!("Only agent tabs have conversation IDs")
         }
         let entry = s.entries.iter_mut().find(|e| e.id == id).unwrap();
+        if entry.lease.as_ref().is_some_and(|l| l.live()) {
+            bail!("Work is reserved by an operation")
+        };
         entry.session_id = Some(session);
         entry.session_verified = true;
         Ok(())
     })?;
-    println!("Bound {id} to {session}");
+    if report {
+        println!("Bound {id} to {session}");
+    }
     Ok(())
 }
 
@@ -293,6 +301,9 @@ fn unique_matches<'a>(entries: &'a [&Entry], roots: &'a [Root]) -> Vec<(&'a Entr
     linked
 }
 pub fn automatic(store: &Store, dry_run: bool) -> Result<()> {
+    automatic_report(store, dry_run, true)
+}
+pub fn automatic_report(store: &Store, dry_run: bool, report: bool) -> Result<()> {
     let state = store.read()?;
     let windows = ghostty::snapshot()?;
     let entries: Vec<_> = state
@@ -323,15 +334,17 @@ pub fn automatic(store: &Store, dry_run: bool) -> Result<()> {
         } else {
             None
         };
-        println!(
-            "{} {} → PID {}{}",
-            if dry_run { "Would attach" } else { "Attached" },
-            e.name,
-            r.pid,
-            session
-                .map(|id| format!(" · verified session {id}"))
-                .unwrap_or(" · session still unverified".into())
-        );
+        if report {
+            println!(
+                "{} {} → PID {}{}",
+                if dry_run { "Would attach" } else { "Attached" },
+                e.name,
+                r.pid,
+                session
+                    .map(|id| format!(" · verified session {id}"))
+                    .unwrap_or(" · session still unverified".into())
+            );
+        }
         updates.push((e.id, r.clone(), session));
     }
     if !dry_run && !updates.is_empty() {
@@ -349,10 +362,12 @@ pub fn automatic(store: &Store, dry_run: bool) -> Result<()> {
             .filter(|e| e.needs_session())
             .count()
     };
-    println!(
-        "{} unique process matches; {unresolved} conversations still need verification. Identical tabs are not matched by order or latest file.",
-        updates.len()
-    );
+    if report {
+        println!(
+            "{} unique process matches; {unresolved} conversations still need verification. Identical tabs are not matched by order or latest file.",
+            updates.len()
+        );
+    }
     Ok(())
 }
 fn apply_discovered(state: &mut State, updates: &[(Uuid, Root, Option<Uuid>)]) -> Result<()> {
@@ -385,6 +400,7 @@ fn apply_discovered(state: &mut State, updates: &[(Uuid, Root, Option<Uuid>)]) -
                 agents_started: 0,
                 last_error: None,
                 exit_code: None,
+                ..Run::default()
             },
         );
     }
