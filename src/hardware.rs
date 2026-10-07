@@ -91,6 +91,7 @@ pub struct Host {
     pub updated: Option<Instant>,
     pub error: Option<String>,
     pub history: [VecDeque<u64>; 4],
+    pub sample_times: VecDeque<Instant>,
 }
 impl Host {
     pub fn live(&self) -> bool {
@@ -100,6 +101,11 @@ impl Host {
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
     }
     fn receive(&mut self, sensors: Sensors) {
+        let now = Instant::now();
+        if self.sample_times.len() == 60 {
+            self.sample_times.pop_front();
+        }
+        self.sample_times.push_back(now);
         let values = [
             sensors.ram_used as f64 / sensors.ram_total as f64,
             sensors.efficiency.ratio,
@@ -113,7 +119,7 @@ impl Host {
             history.push_back((value * 100.) as u64);
         }
         self.sensors = Some(sensors);
-        self.updated = Some(Instant::now());
+        self.updated = Some(now);
         self.error = None;
     }
 }
@@ -343,6 +349,7 @@ mod tests {
             host.receive(parse(&serde_json::to_vec(&fixture()).unwrap()).unwrap());
         }
         assert_eq!(host.history[0].len(), 60);
+        assert_eq!(host.sample_times.len(), 60);
         assert!(host.live());
         host.updated = Some(Instant::now() - Duration::from_secs(6));
         assert!(!host.live());

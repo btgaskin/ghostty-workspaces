@@ -209,6 +209,15 @@ enum Action {
     },
     /// Print current hardware samples as JSON; missing or disconnected sensors are explicit.
     Sensors,
+    /// Bind this Codex conversation from its shell: !gws bind-here.
+    BindHere {
+        #[arg(long)]
+        item: Option<Uuid>,
+        #[arg(long)]
+        session: Option<Uuid>,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove a saved tab from the workspace. Does not stop processes or delete agent history.
     Forget { id: Uuid },
     /// Print integration health and storage location.
@@ -861,6 +870,24 @@ fn dispatch(
                         true,
                     )?;
                 }
+            }
+        }
+        Action::BindHere {
+            item,
+            session,
+            dry_run,
+        } => {
+            let result = binding::here(&store, item, session, dry_run)?;
+            if json {
+                emit(&result, true)?;
+            } else {
+                println!(
+                    "{} {} ({}) to conversation {}",
+                    if dry_run { "Would bind" } else { "Bound" },
+                    result["name"].as_str().unwrap_or("work"),
+                    result["item_id"].as_str().unwrap_or(""),
+                    result["conversation_id"].as_str().unwrap_or("")
+                );
             }
         }
         Action::Sensors => return hardware::print_samples(&hosts),

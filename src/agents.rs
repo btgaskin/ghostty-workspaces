@@ -164,7 +164,8 @@ pub fn command(store: &Store, entry: &Entry, token: Uuid) -> Result<Command> {
     cmd.current_dir(&entry.cwd);
     cmd.env("PATH", launch_path()?);
     cmd.env("GWS_ITEM_ID", entry.id.to_string())
-        .env("GWS_RUN_ID", token.to_string());
+        .env("GWS_RUN_ID", token.to_string())
+        .env("GWS_STATE_DIR", &store.dir);
     if let Some(home) = &entry.provider_home {
         cmd.env(
             if entry.agent == Agent::Codex {

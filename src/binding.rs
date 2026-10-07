@@ -407,6 +407,237 @@ fn apply_discovered(state: &mut State, updates: &[(Uuid, Root, Option<Uuid>)]) -
     Ok(())
 }
 
+/// Bind only the invoking Codex conversation; directory proximity is not identity.
+pub fn here(
+    store: &Store,
+    item: Option<Uuid>,
+    session: Option<Uuid>,
+    dry_run: bool,
+) -> Result<Value> {
+    let env_uuid = |name: &str| -> Result<Option<Uuid>> {
+        std::env::var(name)
+            .ok()
+            .map(|s| Uuid::parse_str(&s).with_context(|| format!("Invalid {name}")))
+            .transpose()
+    };
+    let thread = env_uuid("CODEX_THREAD_ID")?;
+    if session.zip(thread).is_some_and(|(a, b)| a != b) {
+        bail!("Supplied conversation differs from the current Codex thread")
+    }
+    let session = thread.or(session).context("Run !gws bind-here inside Codex; if this version omits its thread ID, supply --session CONVERSATION_ID")?;
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(crate::model::home()?.join(".codex"));
+    let home = home.canonicalize().context("Codex home is unavailable")?;
+    let state = store.read()?;
+    let (catalog, _) = crate::catalog::collect(store)?;
+    let conversations: Vec<_> = catalog
+        .iter()
+        .filter(|c| {
+            c.provider == Agent::Codex
+                && c.id == session
+                && !c.subagent
+                && c.parent.is_none()
+                && c.provider_home.canonicalize().ok().as_ref() == Some(&home)
+        })
+        .collect();
+    if conversations.len() != 1 {
+        bail!("Current root conversation metadata is unavailable or ambiguous; no binding changed")
+    }
+    let conversation = conversations[0];
+    let transcript = conversation
+        .transcript_path
+        .clone()
+        .context("Transcript metadata path missing")?;
+    let context_item = env_uuid("GWS_ITEM_ID")?;
+    let context_run = env_uuid("GWS_RUN_ID")?;
+    if context_item.is_some() != context_run.is_some() {
+        bail!("Incomplete gws run context; no binding changed")
+    }
+    if let Some(id) = context_item {
+        if item.is_some_and(|other| other != id) {
+            bail!("--item differs from the current gws work item")
+        }
+        let run = state.runs.get(&id).context("Current gws run is missing")?;
+        if Some(run.token) != context_run || run.ended || !run.live() {
+            bail!("Current gws run context is stale; no binding changed")
+        }
+    }
+    // Ancestry is optional for explicit item/context binding, but never replaced by cwd guessing.
+    let parents = parent_inventory().ok();
+    let mut ancestry = vec![];
+    let mut next = Some(std::process::id());
+    while let (Some(pid), Some(parents)) = (next, parents.as_ref()) {
+        if ancestry.contains(&pid) {
+            break;
+        }
+        ancestry.push(pid);
+        next = parents.get(&pid).map(|p| p.0);
+    }
+    let roots = discover().unwrap_or_default();
+    let root = roots.iter().find(|r| {
+        ancestry.contains(&r.pid)
+            && r.cwd
+                .canonicalize()
+                .ok()
+                .zip(conversation.cwd.canonicalize().ok())
+                .is_some_and(|(a, b)| a == b)
+    });
+    if root.is_some_and(|r| !r.sessions.is_empty() && !r.sessions.contains(&session)) {
+        bail!("Conversation does not match the invoking Codex process")
+    }
+    let invoking_run = |r: &Run| {
+        (ancestry.contains(&r.pid) && process::start_time(r.pid) == Some(r.start_time))
+            || r.child_pid.zip(r.child_start).is_some_and(|(pid, start)| {
+                ancestry.contains(&pid) && process::start_time(pid) == Some(start)
+            })
+    };
+    let id = if let Some(id) = context_item.or(item) {
+        id
+    } else {
+        let by_process: Vec<_> = state
+            .entries
+            .iter()
+            .filter(|e| {
+                state
+                    .runs
+                    .get(&e.id)
+                    .is_some_and(|r| !r.ended && r.live() && invoking_run(r))
+            })
+            .collect();
+        if by_process.len() == 1 {
+            by_process[0].id
+        } else {
+            let exact: Vec<_> = state
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.agent == Agent::Codex
+                        && e.session_id == Some(session)
+                        && e.provider_home
+                            .as_ref()
+                            .is_none_or(|h| h.canonicalize().ok().as_ref() == Some(&home))
+                })
+                .collect();
+            if exact.len() == 1 {
+                exact[0].id
+            } else if let Some(root) = root {
+                let entries: Vec<_> = state.entries.iter().filter(|e| e.imported).collect();
+                let linked = unique_matches(&entries, &roots);
+                linked.iter().find(|(_,r)| r.pid == root.pid).map(|(e,_)| e.id).context("Saved tab is ambiguous; run !gws bind-here --item WORK_ID (find IDs with gws list)")?
+            } else {
+                bail!(
+                    "No unique saved item for this conversation; run gws save first, or use !gws bind-here --item WORK_ID"
+                )
+            }
+        }
+    };
+    let ensure_unclaimed = |s: &State| -> Result<()> {
+        if let Some((owner, _)) = s
+            .runs
+            .iter()
+            .find(|(owner, run)| **owner != id && run.live() && invoking_run(run))
+        {
+            bail!("Invoking execution is already owned by work item {owner}; no binding changed")
+        }
+        Ok(())
+    };
+    ensure_unclaimed(&state)?;
+    let entry = state.entry(id)?;
+    if entry.agent != Agent::Codex {
+        bail!("Selected work item is not Codex")
+    }
+    if entry.cwd != conversation.cwd
+        && entry
+            .cwd
+            .canonicalize()
+            .ok()
+            .zip(conversation.cwd.canonicalize().ok())
+            .is_none_or(|(a, b)| a != b)
+    {
+        bail!("Selected item belongs to a different project directory")
+    }
+    if entry
+        .provider_home
+        .as_ref()
+        .is_some_and(|h| h.canonicalize().ok().as_ref() != Some(&home))
+    {
+        bail!("Selected item belongs to a different Codex home")
+    }
+    if let Some(run) = state.runs.get(&id).filter(|r| r.live()) {
+        let same_thread =
+            context_item == Some(id) && entry.session_verified && entry.session_id == Some(session);
+        if !same_thread && !invoking_run(run) {
+            bail!("Selected item has another live execution; no binding changed")
+        }
+    }
+    if entry.lease.as_ref().is_some_and(|l| l.live()) {
+        bail!("Work is reserved by an operation")
+    }
+    let expected_run = state.runs.get(&id).map(|r| r.token);
+    if !dry_run {
+        store.update(|s| {
+            ensure_unclaimed(s)?;
+            let current = s.entry(id)?;
+            if current.revision != entry.revision
+                || current.binding_key() != entry.binding_key()
+                || s.runs.get(&id).map(|r| r.token) != expected_run
+            {
+                bail!("Work changed during binding; retry !gws bind-here")
+            }
+            if current.lease.as_ref().is_some_and(|l| l.live()) {
+                bail!("Work is reserved by an operation")
+            }
+            if context_item.is_some() && !s.runs.get(&id).is_some_and(|r| !r.ended && r.live()) {
+                bail!("Current gws run ended during binding")
+            }
+            let checked = crate::catalog::metadata(&transcript, &home, false)
+                .context("Conversation metadata became unavailable")?;
+            if checked.id != session
+                || checked.cwd != conversation.cwd
+                || checked.subagent
+                || checked.parent.is_some()
+            {
+                bail!("Conversation metadata changed during binding")
+            }
+            if let Some(r) = root {
+                if process::start_time(r.pid) != Some(r.start) {
+                    bail!("Invoking Codex process changed")
+                }
+                if s.runs.get(&id).is_none_or(|r| !r.live()) {
+                    s.runs.insert(
+                        id,
+                        Run {
+                            token: Uuid::new_v4(),
+                            pid: r.pid,
+                            start_time: r.start,
+                            created: crate::model::now(),
+                            boot: crate::model::boot_id(),
+                            terminal_id: entry.terminal_id.clone(),
+                            activity: "unknown".into(),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            let e = s
+                .entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .context("Work item disappeared")?;
+            e.session_id = Some(session);
+            e.session_verified = true;
+            e.provider_home = Some(home.clone());
+            e.transcript_path = Some(transcript.clone());
+            e.ever_started = true;
+            Ok(())
+        })?;
+    }
+    Ok(
+        serde_json::json!({"schema_version":1,"item_id":id,"name":entry.name,"conversation_id":session,"state":if dry_run{"would_bind"}else{"bound"},"source":if item.is_some() || thread.is_none() { "explicit_item_or_session + root_transcript_metadata" } else { "current_codex_context + root_transcript_metadata" },"hooks_attached":false}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

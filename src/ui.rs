@@ -13,12 +13,15 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::Marker,
     text::Line,
-    widgets::{Block, Borders, Gauge, Paragraph, Row, Sparkline, Table, TableState, Wrap},
+    widgets::{
+        Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
+    },
 };
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::{BufRead, BufReader, Write},
     sync::{
         Arc, Mutex,
@@ -70,6 +73,8 @@ struct Sample {
     groups: Vec<process::NameGroup>,
     owned: BTreeMap<Uuid, Metrics>,
     memory: process::Memory,
+    memory_history: VecDeque<(Instant, f64)>,
+    sampled_at: Option<Instant>,
     hosts: Vec<Host>,
     catalog: Vec<Conversation>,
     catalog_error: Vec<String>,
@@ -253,6 +258,15 @@ impl Worker {
                     s.processes = process.refresh();
                     s.groups = process::name_groups(&s.processes);
                     s.memory = memory.sample();
+                    if s.memory.total_bytes > 0 {
+                        if s.memory_history.len() == 60 {
+                            s.memory_history.pop_front();
+                        }
+                        s.memory_history.push_back((
+                            Instant::now(),
+                            s.memory.used_bytes as f64 / s.memory.total_bytes as f64 * 100.,
+                        ));
+                    }
                     owned(&mut s);
                 }
                 if inventory.elapsed() >= Duration::from_secs(5) {
@@ -280,6 +294,7 @@ impl Worker {
                     last_history = Instant::now();
                 }
                 s.hosts = monitors.as_ref().map(|m| m.snapshot()).unwrap_or_default();
+                s.sampled_at = Some(Instant::now());
                 s.at = model::now();
                 s.sequence += 1;
                 s.ready = true;
@@ -1066,10 +1081,17 @@ fn draw(f: &mut ratatui::Frame, s: &Sample, list: &[Item], v: &mut View) {
     ])
     .split(area);
     let tabs = format!(
-        " gws   {}Saved   {}History   {}Mac{}",
-        if v.page == Page::Saved { "› " } else { "" },
-        if v.page == Page::History { "› " } else { "" },
-        if v.page == Page::Mac { "› " } else { "" },
+        " gws   {}{}",
+        if v.hardware_only {
+            "› Usage · h returns".into()
+        } else {
+            format!(
+                "{}Saved   {}History   {}Mac",
+                if v.page == Page::Saved { "› " } else { "" },
+                if v.page == Page::History { "› " } else { "" },
+                if v.page == Page::Mac { "› " } else { "" }
+            )
+        },
         if v.paused {
             if s.ready {
                 format!("   PAUSED · frozen sample {}", age(s.memory.observed_at))
@@ -1088,13 +1110,7 @@ fn draw(f: &mut ratatui::Frame, s: &Sample, list: &[Item], v: &mut View) {
     );
     let wide = area.width >= 100 && area.height >= 30;
     let medium = area.width >= 80 && area.height >= 24;
-    let (left, right) = if wide && !v.hardware_only {
-        let c = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(chunks[1]);
-        (c[0], Some(c[1]))
-    } else {
-        (chunks[1], None)
-    };
+    let left = chunks[1];
     if v.help {
         f.render_widget(Paragraph::new("Tab: Saved / History / Mac\n/: fuzzy search   J: Jev rerank History search\nEnter: focus/resume or details   o: open History\nb: generate description   v: Mac groups/processes\np: preview parking   r: preview workspace restore\nQ: prepare profiling   M: pause/resume monitoring\ns: save tabs   d: details   h: hardware   t: technical IDs\nm / c: memory / CPU sort   PgUp/PgDn: scroll\nEsc: back/clear/quit   q: quit\n\nProvider parking: finish/cancel through its own UI, then exit.\nSuspension does not reclaim memory.").block(panel(" Help · any key returns ".into(),v.theme,v.ascii)).wrap(Wrap{trim:false}),left);
     } else if let Some(plan) = &v.plan {
@@ -1167,7 +1183,7 @@ fn draw(f: &mut ratatui::Frame, s: &Sample, list: &[Item], v: &mut View) {
     } else if v.hardware_only {
         draw_hardware(f, left, s, v);
     } else {
-        let summary = if !wide { if medium { 2 } else { 1 } } else { 0 };
+        let summary = 1;
         let sub = Layout::vertical([Constraint::Length(summary), Constraint::Min(1)]).split(left);
         if summary > 0 {
             f.render_widget(
@@ -1203,18 +1219,65 @@ fn draw(f: &mut ratatui::Frame, s: &Sample, list: &[Item], v: &mut View) {
             draw_details(f, a, s, list.get(v.pos().table.selected().unwrap_or(0)), v);
         }
     }
-    if let Some(right) = right {
-        draw_hardware(f, right, s, v);
-    }
     let footer = if v.searching {
         format!("/{} · Enter accepts · Esc returns", v.pos().query)
     } else {
         format!(
-            "{}\nTab views · / search · d details · ? help · q quit",
+            "{}\nTab views · / search · d details · h usage · ? help · q quit",
             v.message
         )
     };
     f.render_widget(Paragraph::new(footer).style(v.theme.muted()), chunks[2]);
+}
+fn short_name(e: &Entry) -> String {
+    let mut words = e.name.split_whitespace();
+    let first = words.next();
+    let program = match first {
+        Some("exec") => words.next(),
+        Some("env") => words.find(|word| !word.contains('=')),
+        _ => first,
+    }
+    .and_then(|word| std::path::Path::new(word).file_name())
+    .and_then(|name| name.to_str());
+    let launch_title = e.imported
+        && match e.agent {
+            model::Agent::Codex => program == Some("codex"),
+            model::Agent::Claude => program == Some("claude"),
+            model::Agent::Cursor => {
+                matches!(program, Some("agent" | "cursor" | "cursor-agent"))
+            }
+            _ => false,
+        };
+    if launch_title {
+        format!(
+            "{} · {}",
+            e.cwd.file_name().unwrap_or_default().to_string_lossy(),
+            match e.agent {
+                model::Agent::Codex => "Codex",
+                model::Agent::Claude => "Claude Code",
+                model::Agent::Cursor => "Cursor",
+                _ => unreachable!(),
+            }
+        )
+    } else {
+        e.name.clone()
+    }
+}
+fn display_name(e: &Entry, s: &Sample) -> String {
+    let name = short_name(e);
+    if name != e.name
+        && s.state
+            .entries
+            .iter()
+            .filter(|other| short_name(other) == name)
+            .count()
+            > 1
+    {
+        let id = e.id.simple().to_string();
+        format!("{name} · {}", &id[id.len() - 6..])
+    } else {
+        name
+    }
 }
 fn draw_list(f: &mut ratatui::Frame, area: Rect, s: &Sample, list: &[Item], v: &mut View) {
     if list.is_empty() {
@@ -1251,11 +1314,15 @@ fn draw_list(f: &mut ratatui::Frame, area: Rect, s: &Sample, list: &[Item], v: &
             Item::Saved(e) => {
                 let m = s.owned.get(&e.id);
                 (
-                    format!(
-                        "{} · {}",
-                        e.name,
-                        e.cwd.file_name().unwrap_or_default().to_string_lossy()
-                    ),
+                    if short_name(e) == e.name {
+                        format!(
+                            "{} · {}",
+                            e.name,
+                            e.cwd.file_name().unwrap_or_default().to_string_lossy()
+                        )
+                    } else {
+                        display_name(e, s)
+                    },
                     status(e, s).to_owned(),
                     m.map(|m| format!("{:.0}", m.memory as f64 / 1048576.))
                         .unwrap_or("-".into()),
@@ -1437,29 +1504,13 @@ fn draw_details(f: &mut ratatui::Frame, area: Rect, s: &Sample, item: Option<&It
             }
         }
         Some(Item::Saved(e)) => {
-            lines.push(Line::from(e.name.clone()).style(v.theme.accent()));
+            lines.push(Line::from(display_name(e, s)).style(v.theme.accent()));
             lines.push(Line::from(e.cwd.display().to_string()));
-            if let Some(d) = s.descriptions.get(&e.id) {
-                lines.push(Line::from(d.description.purpose.clone()));
-                lines.push(Line::from(format!(
-                    "Last progress: {}",
-                    d.description.progress
-                )));
-                lines.push(Line::from(format!(
-                    "Next: {} · blocker: {}",
-                    d.description.next_step, d.description.blocker
-                )));
-                lines.push(Line::from(format!(
-                    "Generated {} · {} / medium · last-known description",
-                    age(d.generated_at),
-                    d.model
-                )));
-            }
             lines.push(Line::from(format!(
-                "{} · {} · {:?}",
-                e.workspace, e.agent, e.intent
+                "Enter: {} · group {}",
+                status(e, s),
+                e.workspace
             )));
-            lines.push(Line::from(format!("Next: {}", status(e, s))));
             if s.state.runs.get(&e.id).is_some_and(|r| cached_live(r, s))
                 && matches!(
                     e.agent,
@@ -1467,10 +1518,37 @@ fn draw_details(f: &mut ratatui::Frame, area: Rect, s: &Sample, item: Option<&It
                 )
             {
                 lines.push(Line::from(
-                    "Park: finish/cancel in provider, then exit CLI. Activity is advisory.",
+                    "Put away: finish/cancel in provider, then exit CLI.",
                 ));
             }
+            if let Some(d) = s.descriptions.get(&e.id) {
+                lines.push(
+                    Line::from(format!("Last-known summary · {}", age(d.generated_at)))
+                        .style(v.theme.muted()),
+                );
+                lines.push(Line::from(d.description.purpose.clone()));
+                lines.push(Line::from(format!(
+                    "Last progress: {}",
+                    d.description.progress
+                )));
+                lines.push(Line::from(format!(
+                    "Next step: {} · blocker: {}",
+                    d.description.next_step, d.description.blocker
+                )));
+                if v.technical {
+                    lines.push(Line::from(format!(
+                        "Generated {} · {} / medium · last-known description",
+                        age(d.generated_at),
+                        d.model
+                    )));
+                }
+            }
             if v.technical {
+                lines.push(Line::from(format!(
+                    "{} · {} · {:?}",
+                    e.workspace, e.agent, e.intent
+                )));
+                lines.push(Line::from(format!("Original title: {}", e.name)));
                 lines.push(Line::from(format!(
                     "Conversation: {}",
                     if e.session_verified {
@@ -1484,23 +1562,29 @@ fn draw_details(f: &mut ratatui::Frame, area: Rect, s: &Sample, item: Option<&It
                 )));
             }
             if let Some(r) = s.state.runs.get(&e.id) {
-                lines.push(Line::from(if r.hooks_seen {
-                    format!(
-                        "Activity {} · subagents {} active / {} started (observed hooks)",
-                        r.activity,
-                        r.agents.len(),
-                        r.agents_started,
-                    )
-                } else {
-                    format!(
-                        "Activity {} · subagents unavailable (no observed hooks)",
-                        r.activity
-                    )
-                }));
+                if v.technical {
+                    lines.push(Line::from(if r.hooks_seen {
+                        format!(
+                            "Activity {} · subagents {} active / {} started (observed hooks)",
+                            r.activity,
+                            r.agents.len(),
+                            r.agents_started,
+                        )
+                    } else {
+                        format!(
+                            "Activity {} · subagents unavailable (no observed hooks)",
+                            r.activity
+                        )
+                    }));
+                }
                 if let Some(error) = &r.last_error {
                     lines.push(Line::from(format!("Latest outcome: {error}")));
                 }
-                if r.ended {
+                if r.ended
+                    && (v.technical
+                        || r.exit_code.is_some_and(|c| c != 0)
+                        || !r.survivors.is_empty())
+                {
                     lines.push(Line::from(format!(
                         "Exited {} · {} survivor records",
                         r.exit_code
@@ -1510,7 +1594,7 @@ fn draw_details(f: &mut ratatui::Frame, area: Rect, s: &Sample, item: Option<&It
                     )));
                 }
             }
-            if let Some(m) = s.owned.get(&e.id) {
+            if let Some(m) = s.owned.get(&e.id).filter(|_| v.technical) {
                 lines.push(Line::from(format!(
                     "{:.1}% CPU (one core) · {:.1} MiB RSS · footprint {}/{} processes",
                     m.cpu,
@@ -1640,130 +1724,120 @@ fn depth(mut pid: u32, root: Option<u32>, all: &BTreeMap<u32, Proc>) -> usize {
     }
     depth
 }
+// Fixed percentage and time axes; separate datasets avoid joining missing intervals.
+fn history_segments(
+    points: impl IntoIterator<Item = (Instant, f64)>,
+    anchor: Instant,
+    gap: Duration,
+) -> Vec<Vec<(f64, f64)>> {
+    let mut segments: Vec<Vec<(f64, f64)>> = vec![];
+    let mut previous = None;
+    for (time, value) in points {
+        let age = anchor.saturating_duration_since(time).as_secs_f64();
+        if age > 60. || !value.is_finite() {
+            continue;
+        }
+        if previous.is_none_or(|prev| time.saturating_duration_since(prev) > gap) {
+            segments.push(vec![]);
+        }
+        segments
+            .last_mut()
+            .unwrap()
+            .push((-age, value.clamp(0., 100.)));
+        previous = Some(time);
+    }
+    segments
+}
+fn draw_plot(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    title: String,
+    segments: &[Vec<(f64, f64)>],
+    v: &View,
+) {
+    if segments.is_empty() {
+        f.render_widget(
+            Paragraph::new("Unavailable · no samples")
+                .wrap(Wrap { trim: false })
+                .block(panel(title, v.theme, v.ascii)),
+            area,
+        );
+        return;
+    }
+    let datasets = segments
+        .iter()
+        .map(|data| {
+            Dataset::default()
+                .data(data)
+                .marker(if v.ascii {
+                    Marker::Dot
+                } else {
+                    Marker::Braille
+                })
+                .graph_type(GraphType::Line)
+                .style(v.theme.accent())
+        })
+        .collect();
+    f.render_widget(
+        Chart::new(datasets)
+            .block(panel(title, v.theme, v.ascii))
+            .x_axis(
+                Axis::default()
+                    .bounds([-60., 0.])
+                    .labels(["-60s", "-30s", if v.paused { "sample" } else { "now" }])
+                    .style(v.theme.muted()),
+            )
+            .y_axis(
+                Axis::default()
+                    .bounds([0., 100.])
+                    .labels(["0%", "100%"])
+                    .style(v.theme.muted()),
+            ),
+        area,
+    );
+    if v.ascii {
+        let buffer = f.buffer_mut();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                let cell = &mut buffer[(x, y)];
+                let symbol = match cell.symbol() {
+                    "•" => ".",
+                    "─" => "-",
+                    "│" => "|",
+                    "└" => "+",
+                    _ => continue,
+                };
+                cell.set_symbol(symbol);
+            }
+        }
+    }
+}
 fn draw_hardware(f: &mut ratatui::Frame, area: Rect, s: &Sample, v: &View) {
     if !s.ready {
         f.render_widget(
             Paragraph::new(if v.paused {
-                "Monitoring paused · no sample collected"
+                "Monitoring paused · no machine sample collected"
             } else {
                 "Collecting machine metrics…"
             })
-            .block(panel(" Memory / sensors ".into(), v.theme, v.ascii)),
+            .block(panel(" Usage · h returns ".into(), v.theme, v.ascii)),
             area,
         );
         return;
     }
     let host = s.hosts.first();
-    if area.height < 27 {
-        let m = &s.memory;
-        let mut lines = vec![
-            Line::from(format!(
-                "RAM {:.1}/{:.1} GiB",
-                m.used_bytes as f64 / 1073741824.,
-                m.total_bytes as f64 / 1073741824.
-            )),
-            Line::from(format!(
-                "Pressure {}",
-                m.pressure.as_deref().unwrap_or("unavailable")
-            )),
-            Line::from(format!(
-                "Compressed {} · swap {:.1} GiB",
-                m.compressed_bytes
-                    .map(|n| format!("{:.1} GiB", n as f64 / 1073741824.))
-                    .unwrap_or("unavailable".into()),
-                m.swap_used_bytes as f64 / 1073741824.
-            )),
-        ];
-        if let Some(sensor) = host.filter(|h| h.live()).and_then(|h| h.sensors.as_ref()) {
-            for (label, load) in [
-                ("E CPU", &sensor.efficiency),
-                ("P CPU", &sensor.performance),
-                ("GPU", &sensor.gpu),
-            ] {
-                lines.push(Line::from(format!(
-                    "{label} {:.0}% · {:.0} MHz {}",
-                    load.ratio * 100.,
-                    load.mhz,
-                    if load.weighted { "scaled" } else { "active" }
-                )));
-            }
-            lines.push(Line::from(format!(
-                "CPU {} C · GPU {} C",
-                sensor
-                    .cpu_temp
-                    .map(|n| format!("{n:.0}"))
-                    .unwrap_or("-".into()),
-                sensor
-                    .gpu_temp
-                    .map(|n| format!("{n:.0}"))
-                    .unwrap_or("-".into())
-            )));
-            lines.push(Line::from(format!(
-                "System power {} W",
-                sensor
-                    .system_power
-                    .map(|n| format!("{n:.1}"))
-                    .unwrap_or("-".into())
-            )));
-        } else {
-            lines.push(Line::from("E/P CPU, GPU and power unavailable"));
-        }
-        lines.push(Line::from(format!(
-            "Sample {} · h returns",
-            age(m.observed_at)
-        )));
-        f.render_widget(
-            Paragraph::new(lines)
-                .block(panel(" Memory / sensors ".into(), v.theme, v.ascii))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-        return;
-    }
-    let slots = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Min(1),
-    ])
-    .split(area);
     let m = &s.memory;
-    let ratio = if m.total_bytes > 0 {
-        (m.used_bytes as f64 / m.total_bytes as f64).clamp(0., 1.)
-    } else {
-        0.
-    };
-    f.render_widget(
-        Gauge::default()
-            .ratio(ratio)
-            .label(format!(
-                "{:.1}/{:.1} GiB",
-                m.used_bytes as f64 / 1073741824.,
-                m.total_bytes as f64 / 1073741824.
-            ))
-            .gauge_style(v.theme.accent())
-            .block(panel(
-                format!(
-                    " Memory · pressure {} ",
-                    m.pressure.as_deref().unwrap_or("unavailable")
-                ),
-                v.theme,
-                v.ascii,
-            )),
-        Rect {
-            height: 3,
-            ..slots[0]
-        },
-    );
-    let foot = Rect {
-        y: slots[0].y + 3,
-        height: slots[0].height.saturating_sub(3),
-        ..slots[0]
-    };
-    f.render_widget(
-        Paragraph::new(format!(
-            "Compressed {} · swap {:.1} GiB\nSwap in/out {} / {} KiB/s",
+    let frozen = if v.paused { " · paused" } else { "" };
+    let mut lines = vec![
+        Line::from(format!(
+            "RAM {:.1}/{:.1} GiB · pressure {}{}",
+            m.used_bytes as f64 / 1073741824.,
+            m.total_bytes as f64 / 1073741824.,
+            m.pressure.as_deref().unwrap_or("unavailable"),
+            frozen
+        )),
+        Line::from(format!(
+            "Compressed {} · swap {:.1} GiB · swap in/out {} / {} KiB/s",
             m.compressed_bytes
                 .map(|n| format!("{:.1} GiB", n as f64 / 1073741824.))
                 .unwrap_or("unavailable".into()),
@@ -1774,114 +1848,168 @@ fn draw_hardware(f: &mut ratatui::Frame, area: Rect, s: &Sample, v: &View) {
             m.swap_out_bytes_per_second
                 .map(|n| format!("{:.1}", n / 1024.))
                 .unwrap_or("-".into())
-        ))
-        .style(v.theme.muted())
-        .wrap(Wrap { trim: false }),
-        foot,
-    );
-    for (index, label) in ["E CPU", "P CPU", "GPU"].iter().enumerate() {
-        let a = slots[index + 1];
-        if let Some(host) = host
-            && let Some(sensor) = &host.sensors
-        {
-            let load = match index {
-                0 => &sensor.efficiency,
-                1 => &sensor.performance,
-                _ => &sensor.gpu,
-            };
-            f.render_widget(
-                Gauge::default()
-                    .ratio(load.ratio)
-                    .label(format!(
-                        "{:.0}% · {:.0} MHz{}",
-                        load.ratio * 100.,
-                        load.mhz,
-                        if load.weighted { " scaled" } else { " active" }
-                    ))
-                    .gauge_style(v.theme.accent())
-                    .block(panel(
-                        format!(" {label}{} ", if host.live() { "" } else { " · stale" }),
-                        v.theme,
-                        v.ascii,
-                    )),
-                Rect { height: 3, ..a },
-            );
-            let data: Vec<_> = host.history[index + 1].iter().copied().collect();
-            f.render_widget(
-                Sparkline::default()
-                    .data(&data)
-                    .max(100)
-                    .style(v.theme.accent()),
-                Rect {
-                    y: a.y + 3,
-                    height: a.height.saturating_sub(3),
-                    ..a
-                },
-            );
-        } else {
-            f.render_widget(
-                Paragraph::new("Unavailable · optional macmon").block(panel(
-                    format!(" {label} "),
-                    v.theme,
-                    v.ascii,
-                )),
-                a,
-            );
-        }
-    }
-    let mut lines = vec![Line::from(if v.paused {
-        format!("Monitoring paused · frozen {}", s.at)
+        )),
+    ];
+    if let Some(sensor) = host.and_then(|h| h.sensors.as_ref()) {
+        lines.push(Line::from(format!(
+            "CPU {} °C · GPU {} °C · power {} W{}",
+            sensor
+                .cpu_temp
+                .map(|n| format!("{n:.0}"))
+                .unwrap_or("-".into()),
+            sensor
+                .gpu_temp
+                .map(|n| format!("{n:.0}"))
+                .unwrap_or("-".into()),
+            sensor
+                .system_power
+                .map(|n| format!("{n:.1}"))
+                .unwrap_or("-".into()),
+            if !v.paused && host.is_some_and(|h| !h.live()) {
+                " · sensors stale"
+            } else {
+                ""
+            }
+        )));
     } else {
-        format!(
-            "This Mac · metrics {} · inventory {}",
-            age(s.memory.observed_at),
-            age(s.inventory_at)
-        )
-    })];
-    if let Some(host) = host {
-        if let Some(sensor) = &host.sensors {
-            lines.push(Line::from(format!(
-                "CPU {} °C · GPU {} °C",
-                sensor
-                    .cpu_temp
-                    .map(|n| format!("{n:.0}"))
-                    .unwrap_or("-".into()),
-                sensor
-                    .gpu_temp
-                    .map(|n| format!("{n:.0}"))
-                    .unwrap_or("-".into())
-            )));
-            lines.push(Line::from(format!(
-                "System power {} W",
-                sensor
-                    .system_power
-                    .map(|n| format!("{n:.1}"))
-                    .unwrap_or("-".into())
-            )));
-        }
-        if let Some(error) = &host.error {
-            lines.push(Line::from(error.clone()));
-        }
+        lines.push(Line::from("E/P CPU and GPU require optional macmon"));
+    }
+    if let Some(error) = host.and_then(|h| h.error.as_ref()) {
+        lines.push(Line::from(error.clone()));
     }
     for remote in s.hosts.iter().skip(1) {
         lines.push(Line::from(format!(
             "{} · {}",
             remote.label,
-            if remote.live() {
+            if v.paused {
+                "paused"
+            } else if remote.live() {
                 "live"
             } else {
                 "unavailable/stale"
             }
         )));
     }
-    lines.push(Line::from(
-        "Footprint/RSS are not an additive RAM partition.",
-    ));
+    if area.height < 18 || (area.width < 70 && area.height.saturating_sub(5) < 28) {
+        if let Some(sensor) = host.and_then(|h| h.sensors.as_ref()) {
+            lines.push(Line::from(
+                [
+                    ("E CPU", &sensor.efficiency),
+                    ("P CPU", &sensor.performance),
+                    ("GPU", &sensor.gpu),
+                ]
+                .into_iter()
+                .map(|(label, load)| {
+                    format!(
+                        "{label} {:.0}%{}",
+                        load.ratio * 100.,
+                        if load.weighted { " scaled" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · "),
+            ));
+        }
+        lines.push(Line::from("Enlarge terminal for history plots · h returns"));
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(panel(" Usage ".into(), v.theme, v.ascii)),
+            area,
+        );
+        return;
+    }
+    let sections = Layout::vertical([Constraint::Min(14), Constraint::Length(5)]).split(area);
+    let anchor = s.sampled_at.unwrap_or_else(Instant::now);
+    let memory = history_segments(
+        s.memory_history.iter().copied(),
+        anchor,
+        Duration::from_secs(5),
+    );
+    let cpu_gpu: Vec<_> = (1..4)
+        .map(|i| {
+            history_segments(
+                host.into_iter().flat_map(|h| {
+                    h.sample_times
+                        .iter()
+                        .copied()
+                        .zip(h.history[i].iter().map(|n| *n as f64))
+                }),
+                anchor,
+                Duration::from_millis(2500),
+            )
+        })
+        .collect();
+    let slots: Vec<_> = if area.width >= 70 {
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(sections[0])
+            .iter()
+            .flat_map(|row| {
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(*row)
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    } else {
+        // Four readable stacked plots require more height on narrow terminals.
+        Layout::vertical([Constraint::Percentage(25); 4])
+            .split(sections[0])
+            .to_vec()
+    };
+    draw_plot(
+        f,
+        slots[0],
+        format!(
+            " RAM · {}{} ",
+            if m.total_bytes > 0 {
+                format!("{:.0}%", m.used_bytes as f64 / m.total_bytes as f64 * 100.)
+            } else {
+                "unavailable".into()
+            },
+            frozen
+        ),
+        &memory,
+        v,
+    );
+    for (i, label) in ["E CPU", "P CPU", "GPU"].iter().enumerate() {
+        let load = host.and_then(|h| h.sensors.as_ref()).map(|sensor| match i {
+            0 => &sensor.efficiency,
+            1 => &sensor.performance,
+            _ => &sensor.gpu,
+        });
+        let title = format!(
+            " {label}{}{}{} ",
+            load.map(|l| format!(
+                " · {:.0}%{}",
+                l.ratio * 100.,
+                if l.weighted { " scaled" } else { "" }
+            ))
+            .unwrap_or_default(),
+            frozen,
+            if !v.paused && host.is_some_and(|h| !h.live()) {
+                " · stale"
+            } else {
+                ""
+            }
+        );
+        draw_plot(f, slots[i + 1], title, &cpu_gpu[i], v);
+    }
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(panel(" Sensors / accounting ".into(), v.theme, v.ascii)),
-        slots[4],
+            .style(v.theme.muted())
+            .block(panel(
+                if v.paused {
+                    " This Mac · frozen 60s window · h returns ".into()
+                } else {
+                    " This Mac · last 60s · h returns ".into()
+                },
+                v.theme,
+                v.ascii,
+            )),
+        sections[1],
     );
 }
 
@@ -1947,6 +2075,7 @@ mod tests {
             updated: Some(Instant::now()),
             error: None,
             history: Default::default(),
+            sample_times: Default::default(),
             sensors: Some(crate::hardware::Sensors {
                 ram_used: s.memory.used_bytes,
                 ram_total: s.memory.total_bytes,
@@ -1963,6 +2092,20 @@ mod tests {
                 ane_power: None,
             }),
         });
+        let anchor = Instant::now();
+        s.sampled_at = Some(anchor);
+        for i in 0..60 {
+            let time = anchor - Duration::from_secs(59 - i);
+            s.hosts[0].sample_times.push_back(time);
+            let values = [38, 12 + (i % 12), 21 + (i % 20), 6 + (i % 8)];
+            for (series, value) in s.hosts[0].history.iter_mut().zip(values) {
+                series.push_back(value);
+            }
+            if i % 2 == 0 {
+                s.memory_history
+                    .push_back((time, 37.5 + (i % 8) as f64 / 4.));
+            }
+        }
         let v = View {
             page: Page::Saved,
             positions: Default::default(),
@@ -2019,6 +2162,9 @@ mod tests {
         s.state.entries[0].intent = model::Intent::Finished;
         assert_eq!(status(&s.state.entries[0], &s), "Finished");
         let b = render(&s, &mut v, 140, 42);
+        assert!(!contents(&b).contains("subagents unavailable"));
+        v.technical = true;
+        let b = render(&s, &mut v, 140, 42);
         assert!(contents(&b).contains("subagents unavailable"));
         assert!(!contents(&b).contains("subagents 0 active"));
     }
@@ -2049,6 +2195,78 @@ mod tests {
         assert_eq!(items(&s, &v).len(), 1);
         v.pos_mut().query = "swap".into();
         assert_eq!(items(&s, &v).len(), 1);
+    }
+    #[test]
+    fn imported_titles_are_readable_disambiguated_and_raw_titles_still_searchable() {
+        let (mut s, mut v) = fixture();
+        let raw = "codex --no-daemon resume 11111111-2222-3333-4444-555555555555";
+        s.state.entries[0].name = raw.into();
+        s.state.entries[0].imported = true;
+        let mut sibling = s.state.entries[0].clone();
+        sibling.id = Uuid::from_u128(77);
+        s.state.entries.push(sibling);
+        assert_ne!(
+            display_name(&s.state.entries[0], &s),
+            display_name(&s.state.entries[2], &s)
+        );
+        assert!(display_name(&s.state.entries[0], &s).starts_with("workspaces · Codex"));
+        for title in [
+            "/opt/homebrew/bin/codex resume 123",
+            "exec /bin/codex resume 123",
+            "env A=b /bin/codex resume 123",
+        ] {
+            let mut entry = s.state.entries[0].clone();
+            entry.name = title.into();
+            assert_eq!(short_name(&entry), "workspaces · Codex");
+        }
+        assert_eq!(display_name(&s.state.entries[1], &s), "Literature notes");
+        let screen = contents(&render(&s, &mut v, 80, 24));
+        assert!(!screen.contains("--no-daemon"));
+        v.pos_mut().query = "555555555555".into();
+        assert_eq!(items(&s, &v).len(), 2);
+        v.technical = true;
+        assert!(contents(&render(&s, &mut v, 140, 42)).contains(raw));
+    }
+    #[test]
+    fn percentage_history_uses_time_and_breaks_gaps_instead_of_inventing_zeroes() {
+        let anchor = Instant::now();
+        let points = [
+            (anchor - Duration::from_secs(80), 30.),
+            (anchor - Duration::from_secs(40), 35.),
+            (anchor - Duration::from_secs(38), 45.),
+            (anchor - Duration::from_secs(20), 55.),
+        ];
+        let segments = history_segments(points, anchor, Duration::from_secs(5));
+        assert_eq!(
+            segments,
+            vec![vec![(-40., 35.), (-38., 45.)], vec![(-20., 55.)]]
+        );
+        let (s, mut v) = fixture();
+        v.hardware_only = true;
+        v.paused = true;
+        let screen = contents(&render(&s, &mut v, 80, 24));
+        for label in [
+            "RAM", "E CPU", "P CPU", "GPU", "100%", "-60s", "paused", "sample", "frozen",
+        ] {
+            assert!(screen.contains(label), "missing {label}");
+        }
+        assert_eq!(render(&s, &mut v, 80, 24), render(&s, &mut v, 80, 24));
+        let mut unavailable = s.clone();
+        unavailable.hosts.clear();
+        assert!(contents(&render(&unavailable, &mut v, 80, 24)).contains("Unavailable"));
+        assert!(!contents(&render(&unavailable, &mut v, 80, 24)).contains("GPU · 0%"));
+        let narrow = contents(&render(&s, &mut v, 40, 20));
+        for label in ["E CPU", "P CPU", "GPU"] {
+            assert!(narrow.contains(label));
+        }
+        let mut scaled = s.clone();
+        scaled.hosts[0]
+            .sensors
+            .as_mut()
+            .unwrap()
+            .efficiency
+            .weighted = true;
+        assert!(contents(&render(&scaled, &mut v, 80, 24)).contains("scaled"));
     }
     #[test]
     fn failed_rerank_releases_only_matching_pending_request_and_allows_retry() {
@@ -2211,6 +2429,17 @@ mod tests {
         for (name, w, h) in [("wide", 140, 42), ("compact", 80, 24), ("narrow", 40, 20)] {
             let b = render(&s, &mut v, w, h);
             let cells:Vec<_>=b.content.iter().map(|c|serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD),"reverse":c.modifier.contains(Modifier::REVERSED)})).collect();
+            std::fs::write(
+                path.join(format!("{name}.json")),
+                serde_json::to_vec(&serde_json::json!({"width":w,"height":h,"cells":cells}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        v.hardware_only = true;
+        for (name, w, h) in [("hardware", 100, 30), ("hardware-compact", 80, 24)] {
+            let b = render(&s, &mut v, w, h);
+            let cells: Vec<_> = b.content.iter().map(|c| serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD),"reverse":c.modifier.contains(Modifier::REVERSED)})).collect();
             std::fs::write(
                 path.join(format!("{name}.json")),
                 serde_json::to_vec(&serde_json::json!({"width":w,"height":h,"cells":cells}))

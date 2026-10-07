@@ -8,6 +8,8 @@ Ghostty owns tabs, rendering, keyboard behavior and selection. Public AppleScrip
 
 Codex's runtime hook session ID is not assumed to be its durable thread ID. A bounded root `session_meta` transcript record provides that identity. Claude lifecycle hooks provide its session ID and transcript path. Cursor uses its exact public CLI chat ID; its private database is not decoded. Generic CLIs get executable/argv/cwd restart semantics.
 
+`bind-here` corroborates the invoking Codex thread with root metadata, its provider home and project directory. Managed work/run context must agree with a verified thread or the invoking process's birth identity. Imported items require exact or reciprocal unique evidence, with an explicit item fallback. It preserves an existing live run token and revalidates metadata and bindings before writing.
+
 Scoped hooks include work/run identities explicitly, reject stale tokens and keep logical agent counts separate from OS descendants. Hook activity is advisory. Shared Codex servers and external helper relationships cannot be allocated to individual tabs from ancestry alone.
 
 ## Ownership before execution
@@ -37,6 +39,8 @@ History retains older executions when current runs change or work is forgotten. 
 ## Sampling, search and profiling
 
 A worker samples processes/memory about every two seconds, Ghostty surfaces every five seconds, optional macmon every second, and conversation metadata every thirty seconds while History is visible. Unchanged bounded headers are cached by file size/mtime. The input thread uses cached liveness and redraws only on changes or input. Collector processes and reader threads are stopped/reaped/joined together.
+
+Saved work uses the full dashboard width; technical provenance and process trees are behind `t`. Imported launch strings get display-only project/provider names, with a short item suffix for duplicates; raw titles and IDs remain searchable. `h` opens a secondary usage view with four framed, fixed 0–100% histories over the last sixty seconds. Samples use monotonic timestamps; missing intervals break lines, and monitoring pause freezes the time window. Native RAM history works without macmon. History is bounded and in memory, not written every tick.
 
 Fuzzy search retrieves local candidates. Explicit Jev reranking classifies at most 25 candidates against descriptive relevance levels. Each result retains fuzzy position, relevance, confidence, distribution and resolved model. Remaining matches retain pagination. Low confidence keeps fuzzy order; failures preserve useful local results. No raw transcript or full absolute project path is sent to Jev.
 

@@ -1,4 +1,4 @@
-# Validation for 0.2.0
+# Validation for 0.2.1
 
 Verified on an Apple Silicon Mac on 7 October 2026. Distinguish fixture acceptance, live provider transport and physical restart behavior.
 
@@ -6,7 +6,7 @@ Verified on an Apple Silicon Mac on 7 October 2026. Distinguish fixture acceptan
 
 - `cargo fmt --all --check`
 - `cargo clippy --offline --all-targets -- -D warnings`
-- `cargo test --offline`: 49 active tests, with two opt-in diagnostic tests normally ignored.
+- `cargo test --offline`: 57 active tests, with two opt-in diagnostic tests normally ignored.
 - `cargo build --offline --release`
 - Opt-in synthetic visual rendering and optimized fuzzy-search benchmark, described below.
 
@@ -16,9 +16,13 @@ Storage fixtures verify read-only inspection without initialization, stable IDs 
 
 Search fixtures verify bounded root metadata, private path exclusion from classifier payloads, confidence bands, backend revision cache separation, strict probability contracts, fuzzy ordering and summary-field coverage. A storage-error UI regression verifies that a failed rerank clears only its matching pending request and permits retry. Temporary utility fixtures verify cancellation/reaping and bounded pipes when a descendant retains a pipe.
 
+Binding fixtures verify read-only previews, root/subagent exclusion, duplicate-folder refusal, refusal to overwrite a foreign live run, refusal to duplicate an invoking execution's owner and inherited custom-state binding from a managed fake provider. Managed binding preserves the run token. A read-only preview in the current live Codex tool shell resolved its exact saved item and transcript thread; literal `!` interaction in the provider UI was not exercised.
+
 ## Appearance and local performance
 
 Ratatui buffers were rendered at 140×42, 100×30, 80×24, 40×20 and 22×12. Wide, compact and narrow images were inspected. The [dashboard illustration](images/dashboard.png) uses synthetic work and machine readings; it is not a live system audit. Light-terminal contrast and real keyboard responsiveness still need physical acceptance.
+
+The updated [usage illustration](images/usage.png) and its 80×24 fixture were inspected. Timestamp tests verify a fixed last-minute window, gaps between missing samples and a frozen paused view. Raw imported invocation fixtures verify short distinct labels, retained UUID search and the original title in technical details. These are source/buffer checks, not physical-terminal acceptance.
 
 An optimized local run matched and sorted 10,000 synthetic history entries over 40 iterations, with query `mem mon`: median **6.33 ms**, p95 **6.99 ms**. This includes fuzzy document construction, filtering and sorting. It excludes filesystem discovery, transcript parsing, rendering and model requests. It is one local microbenchmark, not a device-wide performance guarantee.
 
@@ -37,7 +41,7 @@ Credentials were read from an existing private `.env` file. The repository and s
 
 ## Installed setup
 
-The release binary was installed with a previous-binary backup. Migration of the existing local register preserved every saved work ID and run token, and the original JSON backup was compared with the pre-migration state. Installed `doctor` and read-only `list` succeeded; host-authorized automation reported Ghostty 1.3.1 and the optional macmon binary. No tabs were restarted or stopped for this check, and ambiguous bindings remain unresolved.
+The 0.2.1 release binary was installed with a previous-binary backup, and its read-only `bind-here` preview succeeded in the current Codex context. During initial 0.2.0 setup, migration preserved every saved work ID and run token, and the original JSON backup was compared with the pre-migration state. Installed `doctor` and read-only `list` succeeded; host-authorized automation reported Ghostty 1.3.1 and the optional macmon binary. No tabs were restarted or stopped for these checks, and ambiguous bindings remain unresolved.
 
 ## Acceptance limits
 

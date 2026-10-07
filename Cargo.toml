@@ -1,6 +1,6 @@
 [package]
 name = "ghostty-workspaces"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 description = "Native Ghostty workspaces, agent session continuity, and process monitoring"

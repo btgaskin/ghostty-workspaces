@@ -11,6 +11,14 @@ gws audit --json
 gws operation OPERATION_ID --json
 ```
 
+## Bind the current Codex conversation
+
+Inside the conversation's Codex shell, run `!gws bind-here --dry-run`, then `!gws bind-here`. Managed launches inherit their state directory and work/run context. Imported tabs require one unambiguous saved match; `--item WORK_ID` resolves a duplicate explicitly. Directory proximity alone never selects a conversation.
+
+The command checks the current thread against bounded root transcript metadata, provider home, project directory and live execution identity. If the installed Codex does not supply `CODEX_THREAD_ID`, use `--session CONVERSATION_ID`. Binding records continuity; it does not retroactively install provider hooks or grant permission to stop a shared server.
+
+## Reviewed cleanup
+
 Resource evidence does not grant permission to stop unrelated work. Preserve the controlling session and required services. In a managed shell, identify it explicitly:
 
 ```sh

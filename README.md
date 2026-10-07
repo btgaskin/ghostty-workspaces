@@ -47,7 +47,7 @@ gws restore --preview              # review a workspace restore plan
 gws apply PLAN_ID --wait            # apply that plan
 ```
 
-**Needs binding** means a saved item lacks a verified conversation ID. Several conversations can share one folder, so ambiguous matches stay unresolved. Bind the exact conversation with `gws bind WORK_ID CONVERSATION_ID`.
+**Needs binding** means a saved item lacks a verified conversation ID. In the corresponding Codex conversation, run `!gws bind-here`. If several saved items match, use `!gws bind-here --item WORK_ID`. Preview with `--dry-run`; other providers can use `gws bind WORK_ID CONVERSATION_ID`.
 
 Shells and custom commands restart rather than recover their in-memory state. Split geometry and scrollback are not restored. Real-provider continuation after a physical reboot still needs acceptance testing.
 
@@ -76,12 +76,14 @@ Configuration stores the credential file path, not the key. No model request run
 | Tab | Saved work / History / Mac processes |
 | `/`, `J` | Fuzzy search / explicitly rerank History with Jev |
 | Enter | Focus, resume or inspect the selected item |
-| `d`, `h` | Details / hardware view |
+| `d`, `t`, `h` | Details / technical details / usage history |
 | `M` | Pause or resume monitoring |
 | `Q` | Preview profiling preparation |
 | `?` | All shortcuts |
 
 To reclaim an active agent's memory, finish or cancel in its own UI, then exit the CLI. Automatic stopping is limited to explicitly owned services. Profiling preparation pauses `gws` collectors and model jobs; other apps and shared daemons may remain active.
+
+Usage is a secondary view: press `h` for [RAM, E/P CPU and GPU history](docs/images/usage.png), plotted from 0–100% over the last minute. Missing samples leave gaps.
 
 ## More
 
@@ -89,6 +91,7 @@ To reclaim an active agent's memory, finish or cancel in its own UI, then exit t
 - [Agent commands and service ownership](docs/agent-guide.md)
 - [Resource accounting and optimization](docs/resource-optimization.md)
 - [Validation and current limits](docs/validation.md)
+- [Product direction: sessions and groups](docs/product-direction.md)
 
 Private state lives in `~/.local/share/ghostty-workspaces/`. Keep it out of public repositories. Use `gws --help` for additional commands.
 
