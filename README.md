@@ -4,6 +4,26 @@
 
 `gws` is a small Rust terminal dashboard for macOS and Ghostty 1.3+. It uses native Ghostty tabs and public AppleScript automation. No Ghostty fork, terminal multiplexer, web server, login item, or permanent global daemon.
 
+![Wide terminal dashboard with synthetic data](docs/images/dashboard.png)
+
+*All work names, paths, processes, descriptions and machine readings in this illustration are dummy data, rendered by the actual dashboard.*
+
+## How it works
+
+Think of a saved item as a bookmark for a piece of work. It survives the terminal closing and the computer restarting. An execution is one run of that work; a Ghostty tab is where the run appears.
+
+| Part | What it records | Example |
+| --- | --- | --- |
+| Work item | Stable ID, name, workspace label, project directory and provider | “Dashboard work”, `/projects/dashboard`, Codex |
+| Conversation | Exact provider session/chat ID and provider configuration home | The particular conversation to resume |
+| Run | Execution identity, process ownership, outcome and observed activity | Today's execution of that conversation |
+| Terminal | Current Ghostty surface, when available | Focus the existing tab rather than duplicate it |
+| Description | On-request summary and its source/time | Purpose, progress, blocker and next step |
+
+The directory selects the project. The conversation ID selects the conversation. A workspace is simply a grouping label. The saved work ID remains stable across runs; PID and terminal identities can change.
+
+For new work, start with `gws codex`, `gws claude` or `gws cursor` in the project directory. The item is saved before launch. Codex/Claude lifecycle hooks record the conversation when available; Cursor creates or resumes an exact chat ID. Hooks must be accepted through the provider's normal trust flow. After exit or reboot, explicitly open one item or review a workspace restore plan. The dashboard itself never starts every saved item automatically.
+
 ## Install and launch
 
 ```sh
@@ -50,6 +70,14 @@ gws inspect SAVED_WORK_ID --json
 
 Existing Codex discovery requires reciprocal unique process/cwd/launch matches and a bounded root transcript metadata record. Titles alone are unverified. Ambiguous matches stay unresolved; identical tabs are never assigned by order or newest file. Imported processes have conservative control capabilities. Existing Claude/Cursor sessions can be bound explicitly. Provider hooks do not attach retroactively.
 
+### What “Needs binding” means
+
+The tab has been saved, but `gws` does not yet have a verified conversation ID to reopen. It does **not** mean that the transcript is lost or that the provider needs logging in again. Two conversations can use the same folder, so choosing that folder's newest conversation would risk resuming the wrong work.
+
+This usually occurs with tabs that were already running before `gws` managed them, or when a managed provider's session-start hook did not record an identity. A title containing an ID is only a clue until verified. New work that has not started yet does not need a pre-existing conversation.
+
+Run `gws bind --auto --dry-run` to inspect unambiguous live Codex matches, then `gws bind --auto` to record them. For remaining items, get the exact ID from that provider's session UI and use `gws bind WORK_ID CONVERSATION_ID`. `gws list` supplies the work IDs; `gws sessions --query 'project'` helps inspect the history catalog. Manual binding records the identity you supply; it does not independently prove that you selected the correct conversation, restart the tab, or attach hooks retroactively. Imported work remains conservative about process control.
+
 After reboot, opening `gws` shows the register without launching all saved work:
 
 ```sh
@@ -78,6 +106,14 @@ gws describe SAVED_WORK_ID --transcript /path/to/export.jsonl
 
 The conversation catalog finds root Codex history across folders, including archived metadata, and registered Claude/Cursor conversations. Subagent logs are excluded from root results. Unchanged metadata headers are cached while the dashboard runs. `gws history` retains run outcomes even after a later execution or forgetting saved work.
 
+### What search actually searches
+
+1. **Discover metadata locally.** Codex root conversation headers are read from its session and archive directories, including provider homes recorded on saved items. Claude/Cursor coverage currently includes registered conversations, not a complete scan of their private histories.
+2. **Fuzzy match.** The query searches names, paths, conversation identities and any already generated descriptions. Each whitespace-separated term must match; matching supports substrings and letters in order, with penalties for gaps. For example, `mem mon` can match “memory monitor.” The History view searches conversations; Saved and Mac search their own lists.
+3. **Optionally rerank.** `J` in History, or `gws search --semantic`, asks Jev to assess only the top 25 fuzzy candidates. It changes their order and retains the remaining fuzzy matches. It cannot find a conversation that fuzzy retrieval missed.
+
+This is **metadata and cached-description search**, not full-transcript text search. Unregistered Codex rows initially use their project directory name, so different conversations in one folder may look similar. A task mentioned only inside an unsummarized transcript will not be found by that phrase. Use `gws describe WORK_ID` to generate a description from a bounded transcript excerpt; generation is explicit and the description can become stale as work continues.
+
 Descriptions record purpose, last evidenced progress, blocker and next step, with source fingerprint, conversation, model and timestamp. Only bounded user/assistant text is used; tool outputs, images, system messages and environment instructions are excluded. These generated descriptions are advisory and never prove that a run is idle or authorize cleanup. They use an ephemeral headless Codex run with project configuration and tools disabled. Model generation is never automatic.
 
 ### Optional Jev reranking
@@ -91,15 +127,13 @@ Alternatively set `TYPESAFE_API_KEY`, `JEV_KEY`, or `GWS_JEV_ENV_FILE`. Configur
 
 Fuzzy retrieval stays local and immediate. An explicit semantic search sends at most 25 fuzzy candidates to the [official Jev API](https://docs.typesafe.ai/api), using names, project basenames and cached descriptions. Raw transcripts and full absolute project paths are excluded. Jev returns relevance, its probability distribution and confidence. Confident relevant candidates move ahead; uncertain candidates retain fuzzy order; confidently unrelated candidates follow. Remaining fuzzy results stay available. Failures retain local results with an explicit error. Responses are cached for ten minutes, with at most 128 entries.
 
+With the default `0.6` confidence threshold, confident candidates scoring at least `1` on the `0–2` relevance scale move first, uncertain candidates stay in their relative fuzzy order, and confidently unrelated candidates move last. Your query is sent along with candidate metadata; names and descriptions may contain private project information. Jev search is optional and never authorizes process actions.
+
 The default confidence threshold is an adjustable policy, not a calibrated accuracy claim. The replaceable `RelevanceClassifier` interface retains backend/model revision for each response. A resident, hot-loaded local classifier is a future backend; no model is loaded per keystroke or kept resident by this release.
 
 ## Dashboard
 
 Wide screens put the work list above selected details on the left, with memory and hardware panels on the right. Medium screens stack list/details with a compact machine summary. Narrow screens keep the list and offer a dedicated details view. Native terminal colors are the default; `--theme dark` uses a restrained mint palette, and `--theme mono` / `--ascii` support simpler terminals.
-
-![Wide terminal dashboard](docs/images/dashboard.png)
-
-*Illustration rendered from synthetic work and machine readings.*
 
 | Key | Action |
 | --- | --- |

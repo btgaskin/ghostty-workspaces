@@ -2091,7 +2091,123 @@ mod tests {
         };
         let path = std::path::Path::new(&root);
         std::fs::create_dir_all(path).unwrap();
-        let (s, mut v) = fixture();
+        let (mut s, mut v) = fixture();
+        // Entirely synthetic: never discover provider files, tabs or live processes.
+        s.state.entries.clear();
+        s.state.runs.clear();
+        let examples = [
+            ("Memory dashboard", "atlas", model::Agent::Codex, 768, 4.2),
+            ("API migration", "orchard", model::Agent::Claude, 512, 1.4),
+            ("UI polish", "solstice", model::Agent::Cursor, 384, 0.8),
+            ("Preview server", "atlas", model::Agent::Command, 192, 0.3),
+            ("Test runner", "orchard", model::Agent::Command, 96, 0.1),
+            ("Release notes", "solstice", model::Agent::Codex, 0, 0.0),
+            ("Benchmark plan", "atlas", model::Agent::Claude, 0, 0.0),
+            ("Imported tab", "sandbox", model::Agent::Codex, 0, 0.0),
+            ("Docs cleanup", "orchard", model::Agent::Codex, 0, 0.0),
+        ];
+        let mut tabs = vec![];
+        for (i, (name, project, agent, mib, cpu)) in examples.into_iter().enumerate() {
+            let id = Uuid::from_u128(i as u128 + 1);
+            let cwd = format!("/demo/projects/{project}");
+            let active = mib > 0;
+            let terminal_id = format!("demo-terminal-{i}");
+            s.state.entries.push(Entry {
+                id,
+                name: name.into(),
+                workspace: "demo".into(),
+                cwd: cwd.clone().into(),
+                agent,
+                ever_started: true,
+                session_verified: i != 7,
+                session_id: (i != 7).then_some(Uuid::from_u128(i as u128 + 100)),
+                imported: i == 7,
+                intent: if active {
+                    model::Intent::Active
+                } else if i == 8 {
+                    model::Intent::Finished
+                } else {
+                    model::Intent::Parked
+                },
+                terminal_id: active.then_some(terminal_id.clone()),
+                ..Default::default()
+            });
+            let mut run = model::Run {
+                token: Uuid::from_u128(i as u128 + 200),
+                ended: !active,
+                exit_code: (!active).then_some(0),
+                hooks_seen: i < 2,
+                activity: if active { "working" } else { "ended" }.into(),
+                ..Default::default()
+            };
+            if active {
+                let pid = 41000 + i as u32;
+                let p = Proc {
+                    pid,
+                    parent: None,
+                    name: agent.to_string(),
+                    cpu,
+                    memory: mib * 1048576,
+                    start_time: s.at - 2400,
+                    footprint: Some(mib * 1048576),
+                    state: "Running".into(),
+                };
+                run.pid = pid;
+                run.start_time = p.start_time;
+                s.processes.insert(pid, p.clone());
+                s.owned.insert(
+                    id,
+                    Metrics {
+                        cpu,
+                        memory: p.memory,
+                        processes: vec![p],
+                        footprint: Some(mib * 1048576),
+                        footprint_coverage: 1,
+                    },
+                );
+                tabs.push(ghostty::Tab {
+                    id: format!("demo-tab-{i}"),
+                    name: name.into(),
+                    terminals: vec![ghostty::Surface {
+                        id: terminal_id,
+                        cwd,
+                    }],
+                });
+            }
+            if i == 0 {
+                run.agents = BTreeMap::from([
+                    ("demo-agent-a".into(), "review".into()),
+                    ("demo-agent-b".into(), "tests".into()),
+                ]);
+                run.agents_started = 3;
+            }
+            s.state.runs.insert(id, run);
+        }
+        s.windows = vec![Window {
+            id: "demo-window".into(),
+            tabs,
+        }];
+        s.descriptions.insert(
+            Uuid::from_u128(1),
+            crate::descriptions::SavedDescription {
+                schema_version: 1,
+                item: Uuid::from_u128(1),
+                conversation: Uuid::from_u128(100).to_string(),
+                description: crate::descriptions::Description {
+                    purpose: "Track memory pressure and resumable development work.".into(),
+                    progress: "Resource panels complete; recovery checks in progress.".into(),
+                    blocker: "None recorded".into(),
+                    next_step: "Review restart behavior".into(),
+                },
+                generated_at: s.at - 120,
+                model: "demo summary".into(),
+                reasoning_effort: "medium".into(),
+                source_path: "/demo/transcript.jsonl".into(),
+                source_fingerprint: "synthetic".into(),
+                excerpt_limited: true,
+            },
+        );
+        v.message = "Demo · all data synthetic · Enter: focus/resume · /: search".into();
         for (name, w, h) in [("wide", 140, 42), ("compact", 80, 24), ("narrow", 40, 20)] {
             let b = render(&s, &mut v, w, h);
             let cells:Vec<_>=b.content.iter().map(|c|serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD),"reverse":c.modifier.contains(Modifier::REVERSED)})).collect();
