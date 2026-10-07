@@ -411,13 +411,22 @@ pub fn apply_hook(store: &Store, id: Uuid, token: Uuid, agent: Agent, input: &Va
         run.activity = match event {
             "UserPromptSubmit" | "PreToolUse" => "working",
             "PermissionRequest" => "awaiting_input",
+            "SubagentStart" | "SubagentStop" => run.activity.as_str(),
             _ => "unknown",
         }
         .into();
+        if matches!(event, "UserPromptSubmit" | "PreToolUse") {
+            run.last_turn_end = None;
+        }
+        if event == "Stop" {
+            run.completed_turns = run.completed_turns.saturating_add(1);
+            run.last_turn_end = Some(crate::model::now());
+        }
         match event {
             "SessionStart" => {
                 // A new root conversation (including /clear) resets old logical agents.
                 if input["source"] != "compact" {
+                    run.last_turn_end = None;
                     run.agents.clear();
                     run.agents_started = 0;
                 }
@@ -588,6 +597,14 @@ mod tests {
     #[test]
     fn logical_agents_are_idempotent_and_survive_concurrent_events() {
         let (_dir, s, id, token) = fixture();
+        apply_hook(
+            &s,
+            id,
+            token,
+            Agent::Codex,
+            &json!({"hook_event_name":"UserPromptSubmit"}),
+        )
+        .unwrap();
         let mut workers = vec![];
         for n in 0..12 {
             let s = s.clone();
@@ -602,6 +619,7 @@ mod tests {
         let state = s.read().unwrap();
         assert_eq!(state.runs[&id].agents.len(), 12);
         assert_eq!(state.runs[&id].agents_started, 12);
+        assert_eq!(state.runs[&id].activity, "working");
         apply_hook(
             &s,
             id,
@@ -611,6 +629,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.read().unwrap().runs[&id].agents.len(), 11);
+        assert_eq!(s.read().unwrap().runs[&id].activity, "working");
+        apply_hook(
+            &s,
+            id,
+            token,
+            Agent::Codex,
+            &json!({"hook_event_name":"Stop"}),
+        )
+        .unwrap();
+        assert_eq!(s.read().unwrap().runs[&id].completed_turns, 1);
+        apply_hook(
+            &s,
+            id,
+            token,
+            Agent::Codex,
+            &json!({"hook_event_name":"UserPromptSubmit"}),
+        )
+        .unwrap();
+        let run = &s.read().unwrap().runs[&id];
+        assert_eq!(run.activity, "working");
+        assert_eq!(run.last_turn_end, None);
+        assert_eq!(run.completed_turns, 1);
+        assert_eq!(run.seen_turns, 0);
     }
     #[test]
     fn malformed_store_is_not_overwritten() {

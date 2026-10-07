@@ -76,6 +76,9 @@ Configuration stores the credential file path, not the key. No model request run
 | Tab | Saved work / History / Mac processes |
 | `/`, `J` | Fuzzy search / explicitly rerank History with Jev |
 | Enter | Focus, resume or inspect the selected item |
+| Click a row | Select it |
+| `a` | Acknowledge the selected completion |
+| `B`, click `?` at a row's edge | Binding help; `c` copies the Codex bind command and focuses its tab |
 | `d`, `t`, `h` | Details / technical details / usage history |
 | `M` | Pause or resume monitoring |
 | `Q` | Preview profiling preparation |
@@ -83,7 +86,9 @@ Configuration stores the credential file path, not the key. No model request run
 
 To reclaim an active agent's memory, finish or cancel in its own UI, then exit the CLI. Automatic stopping is limited to explicitly owned services. Profiling preparation pauses `gws` collectors and model jobs; other apps and shared daemons may remain active.
 
-Usage is a secondary view: press `h` for [RAM, E/P CPU and GPU history](docs/images/usage.png), plotted from 0–100% over the last minute. Missing samples leave gaps.
+At desktop widths, RAM, E/P CPU and GPU history run down the right side. Press `h` to [expand usage](docs/images/usage.png). Narrow terminals keep the usage summary and collapse columns. Models show explicit recorded launch settings; otherwise the row shows the provider.
+
+Tiny edge markers replace the action column: `●` working, `◆` finished unread, `○` finished read, `!` attention, `×` exit error and `·` unknown. A separate `?` means unbound. Finished means an observed turn end or process exit; read means viewed in the foreground Ghostty terminal or explicitly acknowledged with `a`. Browsing rows preserves unread markers. Foreground detection runs every five seconds while monitoring is active; it targets the focused split, not the whole tab. The selected panel separates observed hook subagents from tracked OS processes. Shared daemons are not assigned by guesswork.
 
 ## More
 

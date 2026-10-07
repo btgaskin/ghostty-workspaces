@@ -1,4 +1,4 @@
-# Validation for 0.2.1
+# Validation for 0.2.2
 
 Verified on an Apple Silicon Mac on 7 October 2026. Distinguish fixture acceptance, live provider transport and physical restart behavior.
 
@@ -6,7 +6,7 @@ Verified on an Apple Silicon Mac on 7 October 2026. Distinguish fixture acceptan
 
 - `cargo fmt --all --check`
 - `cargo clippy --offline --all-targets -- -D warnings`
-- `cargo test --offline`: 57 active tests, with two opt-in diagnostic tests normally ignored.
+- `cargo test --offline`: 62 active tests, with two opt-in diagnostic tests normally ignored.
 - `cargo build --offline --release`
 - Opt-in synthetic visual rendering and optimized fuzzy-search benchmark, described below.
 
@@ -17,6 +17,8 @@ Storage fixtures verify read-only inspection without initialization, stable IDs 
 Search fixtures verify bounded root metadata, private path exclusion from classifier payloads, confidence bands, backend revision cache separation, strict probability contracts, fuzzy ordering and summary-field coverage. A storage-error UI regression verifies that a failed rerank clears only its matching pending request and permits retry. Temporary utility fixtures verify cancellation/reaping and bounded pipes when a descendant retains a pipe.
 
 Binding fixtures verify read-only previews, root/subagent exclusion, duplicate-folder refusal, refusal to overwrite a foreign live run, refusal to duplicate an invoking execution's owner and inherited custom-state binding from a managed fake provider. Managed binding preserves the run token. A read-only preview in the current live Codex tool shell resolved its exact saved item and transcript thread; literal `!` interaction in the provider UI was not exercised.
+
+Dashboard fixtures verify responsive session columns and recorded models, separate hook-agent/process associations, durable read markers across older supervisor writes, atomic completion storage, parent activity preserved across subagent events and a new prompt clearing the previous finished marker, and binding hit targets and shell quoting. Focus fixtures verify exact split matching, absent/ambiguous focus refusal and preservation of a newer completion arriving during automation. A read-only live Ghostty 1.3.1 probe returned foreground, selected-tab and focused-terminal properties; physical switching, clipboard pasting and click interaction still need acceptance testing.
 
 ## Appearance and local performance
 
@@ -41,7 +43,7 @@ Credentials were read from an existing private `.env` file. The repository and s
 
 ## Installed setup
 
-The 0.2.1 release binary was installed with a previous-binary backup, and its read-only `bind-here` preview succeeded in the current Codex context. During initial 0.2.0 setup, migration preserved every saved work ID and run token, and the original JSON backup was compared with the pre-migration state. Installed `doctor` and read-only `list` succeeded; host-authorized automation reported Ghostty 1.3.1 and the optional macmon binary. No tabs were restarted or stopped for these checks, and ambiguous bindings remain unresolved.
+The 0.2.2 release binary was installed with a previous-binary backup. Its read-only `bind-here` preview refused an item with another live execution and made no binding changes; an earlier 0.2.1 preview resolved the invoking saved item successfully. During initial 0.2.0 setup, migration preserved every saved work ID and run token, and the original JSON backup was compared with the pre-migration state. Installed `doctor` and read-only `list` succeeded; host-authorized automation reported Ghostty 1.3.1 and the optional macmon binary. No tabs were restarted or stopped for these checks, and ambiguous bindings remain unresolved.
 
 ## Acceptance limits
 

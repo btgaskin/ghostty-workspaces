@@ -175,11 +175,34 @@ pub struct Run {
     pub created: u64,
     pub ended_at: Option<u64>,
     pub activity: String,
+    pub completed_turns: u64,
+    pub seen_turns: u64,
+    pub last_turn_end: Option<u64>,
+    pub exit_seen: bool,
     pub activity_at: Option<u64>,
     pub activity_source: Option<String>,
     pub survivors: Vec<(u32, u64)>,
     pub adopted: bool,
     pub owner_run: Option<Uuid>,
+}
+/// Kept separately so an older running supervisor cannot erase notification state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Attention {
+    pub completed_turns: u64,
+    pub seen_turns: u64,
+    pub last_turn_end: Option<u64>,
+    pub exit_seen: bool,
+}
+impl From<&Run> for Attention {
+    fn from(run: &Run) -> Self {
+        Self {
+            completed_turns: run.completed_turns,
+            seen_turns: run.seen_turns,
+            last_turn_end: run.last_turn_end,
+            exit_seen: run.exit_seen,
+        }
+    }
 }
 impl Run {
     pub fn live(&self) -> bool {
@@ -321,6 +344,21 @@ impl Store {
                 .insert(Uuid::parse_str(&id)?, serde_json::from_str(&body)?);
         }
         s.validate()?;
+        use rusqlite::OptionalExtension;
+        let mut q =
+            c.prepare("SELECT body FROM documents WHERE namespace='attention' AND id=?1")?;
+        for run in s.runs.values_mut() {
+            if let Some(body) = q
+                .query_row([run.token.to_string()], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                let attention: Attention = serde_json::from_str(&body)?;
+                run.completed_turns = attention.completed_turns;
+                run.seen_turns = attention.seen_turns;
+                run.last_turn_end = attention.last_turn_end;
+                run.exit_seen = attention.exit_seen;
+            }
+        }
         Ok(s)
     }
     pub fn read(&self) -> Result<State> {
@@ -451,6 +489,28 @@ impl Store {
         }
         s.validate()?;
         Self::write_state(&tx, &s)?;
+        // Keep notification changes in the same transaction as hook/run state.
+        // Older supervisors may omit these fields, so the separate document remains
+        // authoritative when loading a run.
+        for (id, run) in &s.runs {
+            let attention = Attention::from(run);
+            let previous = original
+                .runs
+                .get(id)
+                .filter(|old| old.token == run.token)
+                .map(Attention::from)
+                .unwrap_or_default();
+            if attention != previous {
+                tx.execute(
+                    "INSERT OR REPLACE INTO documents VALUES('attention',?1,?2,?3)",
+                    params![
+                        run.token.to_string(),
+                        serde_json::to_string(&attention)?,
+                        now() as i64
+                    ],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(result)
     }

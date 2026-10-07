@@ -15,7 +15,7 @@ import sys,json,subprocess,uuid
 args=sys.argv[1:]
 settings=json.loads(args[args.index('--settings')+1])
 session=args[args.index('--session-id')+1]
-for event,extra in [('SessionStart',{'source':'startup'}),('SubagentStart',{'agent_id':'worker-1','agent_type':'test'}),('SubagentStart',{'agent_id':'worker-1','agent_type':'test'}),('SubagentStop',{'agent_id':'worker-1'}),('SessionEnd',{})]:
+for event,extra in [('SessionStart',{'source':'startup'}),('SubagentStart',{'agent_id':'worker-1','agent_type':'test'}),('SubagentStart',{'agent_id':'worker-1','agent_type':'test'}),('SubagentStop',{'agent_id':'worker-1'}),('Stop',{}),('SessionEnd',{})]:
     payload={'hook_event_name':event,'session_id':session,**extra}
     command=settings['hooks'][event][0]['hooks'][0]['command']
     subprocess.run(command,shell=True,input=json.dumps(payload),text=True,check=True)
@@ -54,6 +54,9 @@ for event,extra in [('SessionStart',{'source':'startup'}),('SubagentStart',{'age
     assert_eq!(state["runs"][id.to_string()]["ended"], true);
     assert_eq!(state["runs"][id.to_string()]["exit_code"], 0);
     assert_eq!(state["runs"][id.to_string()]["hooks_seen"], true);
+    assert_eq!(state["runs"][id.to_string()]["completed_turns"], 1);
+    assert_eq!(state["runs"][id.to_string()]["seen_turns"], 0);
+    assert_eq!(state["runs"][id.to_string()]["exit_seen"], false);
 }
 
 #[test]

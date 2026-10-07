@@ -9,14 +9,18 @@ use crate::{
     process::{self, Metrics, Monitor, Proc},
 };
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+    MouseEventKind,
+};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols::Marker,
-    text::Line,
+    text::{Line, Span},
     widgets::{
-        Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
+        Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState,
+        Wrap,
     },
 };
 use serde::Serialize;
@@ -270,9 +274,19 @@ impl Worker {
                     owned(&mut s);
                 }
                 if inventory.elapsed() >= Duration::from_secs(5) {
-                    match ghostty::snapshot() {
-                        Ok(w) => {
-                            s.windows = w;
+                    match ghostty::snapshot_with_focus() {
+                        Ok(snapshot) => {
+                            // Only acknowledge completions already observed before this focus
+                            // query. Never reuse a cached focus for a later completion.
+                            if let Err(error) = record_visible_completion(
+                                &store,
+                                &s.state,
+                                snapshot.focused_terminal.as_deref(),
+                                &snapshot.windows,
+                            ) {
+                                s.error = Some(format!("Could not save read marker: {error}"));
+                            }
+                            s.windows = snapshot.windows;
                             s.inventory_error = None
                         }
                         Err(e) => s.inventory_error = Some(e.to_string()),
@@ -354,6 +368,9 @@ struct Position {
     table: TableState,
 }
 struct View {
+    binding: Option<Uuid>,
+    list_area: Option<Rect>,
+    seen: BTreeMap<Uuid, (Uuid, u64, bool)>,
     page: Page,
     positions: [Position; 3],
     searching: bool,
@@ -426,7 +443,7 @@ fn items<'a>(s: &'a Sample, v: &View) -> Vec<Item<'a>> {
     };
     let document = |i: &Item| {
         format!(
-            "{} {} {} {}",
+            "{} {} {} {} {}",
             i.name(),
             i.key(),
             match i {
@@ -446,7 +463,15 @@ fn items<'a>(s: &'a Sample, v: &View) -> Vec<Item<'a>> {
                 d.description.blocker,
                 d.description.next_step
             ))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+            match i {
+                Item::Saved(e) => agent_model(e.agent, Some(e)),
+                Item::History(c) => agent_model(
+                    c.provider,
+                    c.managed_item.and_then(|id| s.state.entry(id).ok())
+                ),
+                _ => String::new(),
+            }
         )
     };
     let mut scored: Vec<_> = out
@@ -520,6 +545,8 @@ fn select(v: &mut View, items: &[Item]) {
     }
 }
 enum Update {
+    Seen,
+    ReadFailed(Uuid, (Uuid, u64, bool), String),
     Message(String),
     Plan(Plan),
     Stopped(Option<std::os::unix::net::UnixStream>),
@@ -588,7 +615,18 @@ pub fn run(store: &Store, hosts: &[String], theme: Theme, ascii: bool) -> Result
     let _socket = Socket(token);
     let (tx, rx) = mpsc::channel();
     let result = ratatui::run(|terminal| -> Result<()> {
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+        struct MouseGuard;
+        impl Drop for MouseGuard {
+            fn drop(&mut self) {
+                let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+            }
+        }
+        let _mouse = MouseGuard;
         let mut view = View {
+            binding: None,
+            list_area: None,
+            seen: BTreeMap::new(),
             page: Page::Saved,
             positions: Default::default(),
             searching: false,
@@ -639,6 +677,13 @@ pub fn run(store: &Store, hosts: &[String], theme: Theme, ascii: bool) -> Result
                         view.receipt = Some(op);
                     }
                     Update::Message(m) => view.message = m,
+                    Update::Seen => {}
+                    Update::ReadFailed(id, expected, error) => {
+                        if view.seen.get(&id) == Some(&expected) {
+                            view.seen.remove(&id);
+                        }
+                        view.message = format!("Could not save read marker: {error}");
+                    }
                     Update::Ranked(request, page, query, result) => {
                         if view.search_request == Some(request)
                             && view.page == page
@@ -738,7 +783,26 @@ pub fn run(store: &Store, hosts: &[String], theme: Theme, ascii: bool) -> Result
             };
             let input = event::read()?;
             dirty = true;
-            let Event::Key(key) = input else { continue };
+            let key = match input {
+                Event::Key(key) => key,
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    let Some((index, bind)) =
+                        clicked_row(&view, list.len(), mouse.column, mouse.row)
+                    else {
+                        continue;
+                    };
+                    view.pos_mut().table.select(Some(index));
+                    view.pos_mut().identity = Some(list[index].key());
+                    if let Item::Saved(e) = &list[index]
+                        && bind
+                        && e.needs_session()
+                    {
+                        view.binding = Some(e.id);
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
             if key.kind != KeyEventKind::Press {
                 continue;
             };
@@ -750,6 +814,22 @@ pub fn run(store: &Store, hosts: &[String], theme: Theme, ascii: bool) -> Result
                         view.pos_mut().query.pop();
                     }
                     KeyCode::Char(c) => view.pos_mut().query.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+            if let Some(id) = view.binding {
+                match key.code {
+                    KeyCode::Esc => view.binding = None,
+                    KeyCode::Char('c') => {
+                        let entry = sample.state.entry(id)?.clone();
+                        let store = store.clone();
+                        view.binding = None;
+                        async_task(tx.clone(), move || {
+                            copy_binding(&store, &entry)?;
+                            Ok(Update::Message("Bind command copied. Paste it into the corresponding Codex conversation and press Enter.".into()))
+                        });
+                    }
                     _ => {}
                 }
                 continue;
@@ -856,7 +936,26 @@ pub fn run(store: &Store, hosts: &[String], theme: Theme, ascii: bool) -> Result
                     }
                 }
                 KeyCode::Char('?') => view.help = true,
+                KeyCode::Char('a') => {
+                    if let Some(Item::Saved(e)) = chosen {
+                        if attention(e, &sample, &view).0 == "◆" {
+                            acknowledge(store, &sample, e, &mut view, tx.clone());
+                            view.message = "Completion acknowledged".into();
+                        } else {
+                            view.message = "No unread completion for selected work".into();
+                        }
+                    }
+                }
                 KeyCode::Char('d') => view.detail_only = !view.detail_only,
+                KeyCode::Char('B') => {
+                    if let Some(Item::Saved(e)) = chosen {
+                        if e.needs_session() {
+                            view.binding = Some(e.id);
+                        } else {
+                            view.message = "Already bound · t shows its exact identity".into();
+                        }
+                    }
+                }
                 KeyCode::Char('h') => view.hardware_only = !view.hardware_only,
                 KeyCode::Char('t') => view.technical = !view.technical,
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -1064,7 +1163,46 @@ fn age(at: u64) -> String {
         format!("{}h ago", seconds / 3600)
     }
 }
+fn overview(s: &Sample, width: u16) -> String {
+    let open = s
+        .state
+        .entries
+        .iter()
+        .filter(|e| s.state.runs.get(&e.id).is_some_and(|r| cached_live(r, s)))
+        .count();
+    let binding = s.state.entries.iter().filter(|e| e.needs_session()).count();
+    let work = format!(
+        "{} saved · {open} open · {binding} need binding",
+        s.state.entries.len()
+    );
+    if !s.ready {
+        return format!("{work} · collecting usage…");
+    }
+    let ram = format!(
+        "RAM {:.1}/{:.1} GiB",
+        s.memory.used_bytes as f64 / 1073741824.,
+        s.memory.total_bytes as f64 / 1073741824.
+    );
+    if width >= 100 {
+        format!(
+            "{work}   |   {ram} · pressure {} · swap {:.1} GiB",
+            s.memory.pressure.as_deref().unwrap_or("unavailable"),
+            s.memory.swap_used_bytes as f64 / 1073741824.
+        )
+    } else if width >= 70 {
+        format!(
+            "{} saved · {open} open · {binding} bind   |   {ram}",
+            s.state.entries.len()
+        )
+    } else {
+        format!(
+            "{} saved · {open} open · {binding} bind",
+            s.state.entries.len()
+        )
+    }
+}
 fn draw(f: &mut ratatui::Frame, s: &Sample, list: &[Item], v: &mut View) {
+    v.list_area = None;
     let area = f.area();
     f.render_widget(Block::default().style(v.theme.base()), area);
     if area.width < 40 || area.height < 10 {
@@ -1076,6 +1214,7 @@ fn draw(f: &mut ratatui::Frame, s: &Sample, list: &[Item], v: &mut View) {
     }
     let chunks = Layout::vertical([
         Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
@@ -1110,9 +1249,55 @@ fn draw(f: &mut ratatui::Frame, s: &Sample, list: &[Item], v: &mut View) {
     );
     let wide = area.width >= 100 && area.height >= 30;
     let medium = area.width >= 80 && area.height >= 24;
-    let left = chunks[1];
+    f.render_widget(
+        Paragraph::new(overview(s, area.width)).style(v.theme.muted()),
+        chunks[1],
+    );
+    let sidebar = area.width >= 100
+        && chunks[2].height >= 24
+        && !v.hardware_only
+        && v.binding.is_none()
+        && !v.help
+        && v.plan.is_none()
+        && v.receipt.is_none();
+    let (left, right) = if sidebar {
+        let c = Layout::horizontal([
+            Constraint::Min(64),
+            Constraint::Length(if area.width >= 120 { 34 } else { 32 }),
+        ])
+        .split(chunks[2]);
+        (c[0], Some(c[1]))
+    } else {
+        (chunks[2], None)
+    };
     if v.help {
-        f.render_widget(Paragraph::new("Tab: Saved / History / Mac\n/: fuzzy search   J: Jev rerank History search\nEnter: focus/resume or details   o: open History\nb: generate description   v: Mac groups/processes\np: preview parking   r: preview workspace restore\nQ: prepare profiling   M: pause/resume monitoring\ns: save tabs   d: details   h: hardware   t: technical IDs\nm / c: memory / CPU sort   PgUp/PgDn: scroll\nEsc: back/clear/quit   q: quit\n\nProvider parking: finish/cancel through its own UI, then exit.\nSuspension does not reclaim memory.").block(panel(" Help · any key returns ".into(),v.theme,v.ascii)).wrap(Wrap{trim:false}),left);
+        f.render_widget(Paragraph::new("Tab: Saved / History / Mac\n/: fuzzy search   J: Jev rerank History search\nEnter: focus/resume or details   o: open History\na: acknowledge selected completion\nb: generate description   v: Mac groups/processes\np: preview parking   r: preview workspace restore\nQ: prepare profiling   M: pause/resume monitoring\ns: save tabs   d: details   h: hardware   t: technical IDs\nB / click ?: bind selected session\nm / c: memory / CPU sort   PgUp/PgDn: scroll\nEsc: back/clear/quit   q: quit\n\nProvider parking: finish/cancel through its own UI, then exit.\nSuspension does not reclaim memory.\n● working · ◆ finished unread · ○ finished read\n! input needed · × exit error · · unknown\nFinished means an observed turn end or process exit. Read: foreground terminal (5s) or a to acknowledge. Browsing rows keeps unread markers.").block(panel(" Help · any key returns ".into(),v.theme,v.ascii)).wrap(Wrap{trim:false}),left);
+    } else if let Some(id) = v.binding {
+        let e = s.state.entry(id).ok();
+        let codex = e.is_some_and(|e| e.agent == model::Agent::Codex);
+        let lines = vec![
+            Line::from("Unbound means the exact conversation identity is not verified."),
+            Line::from("An open session can still be unbound; its activity marker is independent."),
+            Line::from(""),
+            Line::from(if codex {
+                "c: copy binding command and focus its Codex tab"
+            } else {
+                "Use gws bind WORK_ID CONVERSATION_ID with the provider's exact ID."
+            }),
+            Line::from(if codex {
+                "Paste into the corresponding Codex conversation, then press Enter."
+            } else {
+                "Use the provider exact conversation ID; automatic discovery is unavailable here."
+            }),
+            Line::from("Codex supplies its current thread; gws verifies root transcript metadata."),
+            Line::from("Nothing is sent to the provider automatically. Esc returns."),
+        ];
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(panel(" Bind session ".into(), v.theme, v.ascii)),
+            left,
+        );
     } else if let Some(plan) = &v.plan {
         let mut lines = vec![Line::from(format!(
             "{:?} · {} targets · y applies this exact plan",
@@ -1181,36 +1366,17 @@ fn draw(f: &mut ratatui::Frame, s: &Sample, list: &[Item], v: &mut View) {
             left,
         );
     } else if v.hardware_only {
-        draw_hardware(f, left, s, v);
+        draw_hardware(f, left, s, v, false);
     } else {
-        let summary = 1;
-        let sub = Layout::vertical([Constraint::Length(summary), Constraint::Min(1)]).split(left);
-        if summary > 0 {
-            f.render_widget(
-                Paragraph::new(if !s.ready {
-                    "Machine metrics unavailable · monitoring has not collected a sample".into()
-                } else {
-                    format!(
-                        "RAM {:.1}/{:.1} GiB · pressure {} · swap {:.1} GiB",
-                        s.memory.used_bytes as f64 / 1073741824.,
-                        s.memory.total_bytes as f64 / 1073741824.,
-                        s.memory.pressure.as_deref().unwrap_or("unavailable"),
-                        s.memory.swap_used_bytes as f64 / 1073741824.
-                    )
-                })
-                .style(v.theme.muted()),
-                sub[0],
-            );
-        }
         let both = (wide || medium) && !v.detail_only;
         let (list_area, detail_area) = if both {
             let c = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(sub[1]);
+                .split(left);
             (Some(c[0]), Some(c[1]))
         } else if v.detail_only {
-            (None, Some(sub[1]))
+            (None, Some(left))
         } else {
-            (Some(sub[1]), None)
+            (Some(left), None)
         };
         if let Some(a) = list_area {
             draw_list(f, a, s, list, v);
@@ -1219,15 +1385,18 @@ fn draw(f: &mut ratatui::Frame, s: &Sample, list: &[Item], v: &mut View) {
             draw_details(f, a, s, list.get(v.pos().table.selected().unwrap_or(0)), v);
         }
     }
+    if let Some(right) = right {
+        draw_hardware(f, right, s, v, true);
+    }
     let footer = if v.searching {
         format!("/{} · Enter accepts · Esc returns", v.pos().query)
     } else {
         format!(
-            "{}\nTab views · / search · d details · h usage · ? help · q quit",
+            "{}\n● work  ◆ unread  ○ read · a acknowledge · B bind · h usage · ? help",
             v.message
         )
     };
-    f.render_widget(Paragraph::new(footer).style(v.theme.muted()), chunks[2]);
+    f.render_widget(Paragraph::new(footer).style(v.theme.muted()), chunks[3]);
 }
 fn short_name(e: &Entry) -> String {
     let mut words = e.name.split_whitespace();
@@ -1279,7 +1448,237 @@ fn display_name(e: &Entry, s: &Sample) -> String {
         name
     }
 }
+fn agent_model(agent: model::Agent, entry: Option<&Entry>) -> String {
+    let label = match agent {
+        model::Agent::Codex => "Codex",
+        model::Agent::Claude => "Claude",
+        model::Agent::Cursor => "Cursor",
+        model::Agent::Shell => "Shell",
+        model::Agent::Command => "Command",
+    };
+    let mut model = None;
+    if let Some(entry) = entry {
+        let args = entry.resume_args.as_ref().unwrap_or(&entry.args);
+        for (i, arg) in args.iter().enumerate() {
+            let value = if matches!(arg.as_str(), "--model" | "-m") {
+                args.get(i + 1)
+                    .map(String::as_str)
+                    .filter(|v| !v.starts_with('-'))
+            } else {
+                arg.strip_prefix("--model=")
+            };
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                model = Some(value);
+            }
+        }
+    }
+    model
+        .map(|model| format!("{label}/{model}"))
+        .unwrap_or(label.into())
+}
+fn attention(e: &Entry, s: &Sample, v: &View) -> (&'static str, &'static str) {
+    let Some(r) = s.state.runs.get(&e.id) else {
+        return ("·", "No run observed");
+    };
+    if !r.ended && cached_live(r, s) && r.hooks_seen {
+        match r.activity.as_str() {
+            "working" => return ("●", "Working (observed hook)"),
+            "awaiting_input" => return ("!", "Needs input (observed hook)"),
+            _ => {}
+        }
+    }
+    if r.ended && (r.exit_code.is_some_and(|c| c != 0) || r.last_error.is_some()) {
+        return ("×", "Exited with error");
+    }
+    if r.ended && !r.survivors.is_empty() {
+        return ("!", "Exited · survivor records need review");
+    }
+    let seen = v.seen.get(&e.id).filter(|(token, _, _)| *token == r.token);
+    let turns = r.seen_turns.max(seen.map(|(_, seq, _)| *seq).unwrap_or(0));
+    let exit = r.exit_seen || seen.is_some_and(|(_, _, ended)| *ended);
+    if r.last_turn_end.is_some() || r.ended {
+        if (r.last_turn_end.is_some() && r.completed_turns > turns) || (r.ended && !exit) {
+            ("◆", "Finished · unread")
+        } else {
+            ("○", "Finished · read")
+        }
+    } else {
+        ("·", "Open · completion unknown")
+    }
+}
+fn marker(e: &Entry, s: &Sample, v: &View) -> Cell<'static> {
+    let (symbol, _) = attention(e, s, v);
+    let shown = if v.ascii {
+        match symbol {
+            "●" => "*",
+            "◆" => "+",
+            "○" => "o",
+            "×" => "x",
+            "·" => ".",
+            _ => symbol,
+        }
+    } else {
+        symbol
+    };
+    let style = match symbol {
+        "●" => v.theme.accent(),
+        "◆" | "!" => Style::default().fg(Color::Yellow),
+        "×" => Style::default().fg(Color::Red),
+        _ => v.theme.muted(),
+    };
+    Cell::from(Line::from(vec![
+        Span::styled(shown, style),
+        Span::styled(
+            if e.needs_session() { "?" } else { " " },
+            Style::default().fg(Color::Yellow),
+        ),
+    ]))
+}
+fn record_seen(store: &Store, id: Uuid, token: Uuid, turns: u64, ended: bool) -> Result<()> {
+    let state = store.read()?;
+    let Some(run) = state.runs.get(&id).filter(|r| r.token == token) else {
+        return Ok(());
+    };
+    store
+        .edit_document("attention", &token.to_string(), |old| {
+            let mut attention: model::Attention = old
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or(model::Attention {
+                    completed_turns: run.completed_turns,
+                    seen_turns: run.seen_turns,
+                    last_turn_end: run.last_turn_end,
+                    exit_seen: run.exit_seen,
+                });
+            attention.seen_turns = attention
+                .seen_turns
+                .max(turns.min(attention.completed_turns));
+            attention.exit_seen |= ended && run.ended;
+            Ok(attention)
+        })
+        .map(|_| ())
+}
+fn record_visible_completion(
+    store: &Store,
+    state: &State,
+    focused: Option<&str>,
+    windows: &[Window],
+) -> Result<()> {
+    let Some(focused) = focused.filter(|id| ghostty::terminal_exists(windows, id)) else {
+        return Ok(());
+    };
+    let mut matches = state.entries.iter().filter_map(|entry| {
+        let run = state.runs.get(&entry.id)?;
+        (run.terminal_id.as_deref().or(entry.terminal_id.as_deref()) == Some(focused))
+            .then_some((entry, run))
+    });
+    let Some((entry, run)) = matches.next() else {
+        return Ok(());
+    };
+    // An ambiguous surface association cannot establish which saved run was viewed.
+    if matches.next().is_some() {
+        return Ok(());
+    }
+    if (run.last_turn_end.is_some() && run.completed_turns > run.seen_turns)
+        || (run.ended && !run.exit_seen)
+    {
+        record_seen(store, entry.id, run.token, run.completed_turns, run.ended)?;
+    }
+    Ok(())
+}
+fn acknowledge(store: &Store, s: &Sample, e: &Entry, v: &mut View, tx: mpsc::Sender<Update>) {
+    let Some(r) = s.state.runs.get(&e.id) else {
+        return;
+    };
+    if attention(e, s, v).0 != "◆" {
+        return;
+    }
+    let (id, token, turns, ended) = (e.id, r.token, r.completed_turns, r.ended);
+    v.seen.insert(id, (token, turns, ended));
+    let store = store.clone();
+    async_task(tx, move || {
+        Ok(match record_seen(&store, id, token, turns, ended) {
+            Ok(()) => Update::Seen,
+            Err(error) => Update::ReadFailed(id, (token, turns, ended), error.to_string()),
+        })
+    });
+}
+fn clicked_row(v: &View, count: usize, x: u16, y: u16) -> Option<(usize, bool)> {
+    if v.help
+        || v.binding.is_some()
+        || v.plan.is_some()
+        || v.receipt.is_some()
+        || v.hardware_only
+        || v.searching
+    {
+        return None;
+    }
+    let area = v.list_area?;
+    if x <= area.x
+        || x >= area.right().saturating_sub(1)
+        || y < area.y + 2
+        || y >= area.bottom().saturating_sub(1)
+    {
+        return None;
+    }
+    let index = v.pos().table.offset() + (y - area.y - 2) as usize;
+    (index < count).then_some((index, v.page == Page::Saved && x == area.x + 4))
+}
+fn bind_command(store: &Store, e: &Entry) -> Result<String> {
+    anyhow::ensure!(
+        e.agent == model::Agent::Codex,
+        "This shortcut needs Codex; bind other providers with their exact conversation ID"
+    );
+    Ok(format!(
+        "!gws --state-dir {} bind-here --item {}",
+        ghostty::shell_quote(&store.dir.to_string_lossy()),
+        e.id
+    ))
+}
+fn copy_binding(store: &Store, e: &Entry) -> Result<()> {
+    let command = bind_command(store, e)?;
+    let mut child = std::process::Command::new("/usr/bin/pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    let write = child
+        .stdin
+        .take()
+        .context("Clipboard pipe unavailable")?
+        .write_all(command.as_bytes());
+    let status = child.wait();
+    write?;
+    anyhow::ensure!(status?.success(), "Could not copy binding command");
+    if let Some(id) = &e.terminal_id {
+        ghostty::focus(id)?;
+    }
+    Ok(())
+}
+fn location_label(path: &std::path::Path, max: usize, ascii: bool) -> String {
+    let text = model::home()
+        .ok()
+        .and_then(|home| path.strip_prefix(home).ok())
+        .map(|p| format!("~/{}", p.display()))
+        .unwrap_or_else(|| path.display().to_string());
+    if Line::from(text.as_str()).width() <= max {
+        return text;
+    }
+    let prefix = if ascii { "..." } else { "…" };
+    let mut width = prefix.len().min(3);
+    if !ascii {
+        width = 1;
+    }
+    let mut tail = vec![];
+    for c in text.chars().rev() {
+        width += Line::from(c.to_string()).width();
+        if width > max {
+            break;
+        }
+        tail.push(c);
+    }
+    format!("{prefix}{}", tail.into_iter().rev().collect::<String>())
+}
 fn draw_list(f: &mut ratatui::Frame, area: Rect, s: &Sample, list: &[Item], v: &mut View) {
+    v.list_area = Some(area);
     if list.is_empty() {
         let text = if !v.pos().query.is_empty() {
             "No matching items · Esc clears search"
@@ -1309,28 +1708,35 @@ fn draw_list(f: &mut ratatui::Frame, area: Rect, s: &Sample, list: &[Item], v: &
         return;
     }
     let compact = area.width < 60;
+    let work = v.page != Page::Mac;
+    let location_width = if area.width >= 96 {
+        18
+    } else if area.width >= 80 {
+        16
+    } else {
+        12
+    };
     let rows = list.iter().map(|item| {
-        let (name, state, ram, cpu) = match item {
+        let (name, location, agent, state, ram, cpu) = match item {
             Item::Saved(e) => {
                 let m = s.owned.get(&e.id);
                 (
-                    if short_name(e) == e.name {
-                        format!(
-                            "{} · {}",
-                            e.name,
-                            e.cwd.file_name().unwrap_or_default().to_string_lossy()
-                        )
-                    } else {
-                        display_name(e, s)
-                    },
-                    status(e, s).to_owned(),
+                    display_name(e, s),
+                    location_label(&e.cwd, location_width, v.ascii),
+                    agent_model(e.agent, Some(e)),
+                    String::new(),
                     m.map(|m| format!("{:.0}", m.memory as f64 / 1048576.))
                         .unwrap_or("-".into()),
                     m.map(|m| format!("{:.1}", m.cpu)).unwrap_or("-".into()),
                 )
             }
             Item::History(c) => (
-                format!("{} · {}", c.name, c.cwd.display()),
+                c.name.clone(),
+                location_label(&c.cwd, location_width, v.ascii),
+                agent_model(
+                    c.provider,
+                    c.managed_item.and_then(|id| s.state.entry(id).ok()),
+                ),
                 if c.archived {
                     "Archived"
                 } else if c.managed_item.is_some() {
@@ -1350,6 +1756,8 @@ fn draw_list(f: &mut ratatui::Frame, area: Rect, s: &Sample, list: &[Item], v: &
             ),
             Item::Process(p) => (
                 format!("{} · {}", p.name, p.pid),
+                String::new(),
+                String::new(),
                 p.state.clone(),
                 format!(
                     "{:.0} {}",
@@ -1358,11 +1766,13 @@ fn draw_list(f: &mut ratatui::Frame, area: Rect, s: &Sample, list: &[Item], v: &
                 ),
                 format!("{:.1}", p.cpu),
             ),
-            Item::Group(g) => (
-                g.name.clone(),
-                format!("{} processes", g.metrics.processes.len()),
-                {
-                    let complete = g.metrics.footprint_coverage == g.metrics.processes.len();
+            Item::Group(g) => {
+                let complete = g.metrics.footprint_coverage == g.metrics.processes.len();
+                (
+                    g.name.clone(),
+                    String::new(),
+                    String::new(),
+                    format!("{} processes", g.metrics.processes.len()),
                     format!(
                         "{:.0} {}",
                         (if complete {
@@ -1372,56 +1782,146 @@ fn draw_list(f: &mut ratatui::Frame, area: Rect, s: &Sample, list: &[Item], v: &
                         }) as f64
                             / 1048576.,
                         if complete { "FP" } else { "RSS" }
-                    )
-                },
-                format!("{:.1}", g.metrics.cpu),
-            ),
+                    ),
+                    format!("{:.1}", g.metrics.cpu),
+                )
+            }
         };
-        Row::new(if compact {
+        let mut cells: Vec<Cell> = if work {
+            if area.width >= 80 {
+                vec![name, location, agent, ram, cpu]
+            } else if area.width >= 64 {
+                vec![name, location, agent, ram]
+            } else if area.width >= 48 {
+                vec![name, location, agent]
+            } else {
+                vec![name, location]
+            }
+        } else if compact {
             vec![name, state, ram]
         } else {
             vec![name, state, ram, cpu]
-        })
+        }
+        .into_iter()
+        .map(Cell::from)
+        .collect();
+        if work {
+            cells.insert(
+                0,
+                match item {
+                    Item::Saved(e) => marker(e, s, v),
+                    Item::History(c) => c
+                        .managed_item
+                        .and_then(|id| s.state.entry(id).ok())
+                        .map(|e| marker(e, s, v))
+                        .unwrap_or(Cell::from("· ")),
+                    _ => unreachable!(),
+                },
+            );
+        }
+        Row::new(cells)
     });
-    let constraints = if compact {
-        vec![
-            Constraint::Min(12),
-            Constraint::Length(10),
-            Constraint::Length(10),
-        ]
-    } else {
-        vec![
-            Constraint::Min(18),
-            Constraint::Length(14),
-            Constraint::Length(9),
-            Constraint::Length(7),
-        ]
-    };
-    let state_label = if v.page == Page::Mac {
-        "STATE"
-    } else {
-        "ACTION"
-    };
     let ram_label = if v.page == Page::History {
         "CONF %"
-    } else if v.page == Page::Mac {
-        "MiB FP/RSS"
-    } else {
+    } else if work {
         "RSS MiB"
-    };
-    let header = if compact {
-        vec!["WORK", state_label, ram_label]
     } else {
-        vec![
-            "WORK / PROJECT",
-            state_label,
-            ram_label,
-            if v.page == Page::History {
-                "REL /2"
-            } else {
-                "CPU %"
-            },
-        ]
+        "MiB FP/RSS"
+    };
+    let last_label = if v.page == Page::History {
+        "REL /2"
+    } else {
+        "CPU %"
+    };
+    let (header, constraints) = if work {
+        if area.width >= 96 {
+            (
+                vec![
+                    "",
+                    "WORK",
+                    "LOCATION",
+                    "AGENT / MODEL",
+                    ram_label,
+                    last_label,
+                ],
+                vec![
+                    Constraint::Length(2),
+                    Constraint::Min(14),
+                    Constraint::Length(18),
+                    Constraint::Length(22),
+                    Constraint::Length(7),
+                    Constraint::Length(6),
+                ],
+            )
+        } else if area.width >= 80 {
+            (
+                vec![
+                    "",
+                    "WORK",
+                    "LOCATION",
+                    "AGENT / MODEL",
+                    ram_label,
+                    last_label,
+                ],
+                vec![
+                    Constraint::Length(2),
+                    Constraint::Min(14),
+                    Constraint::Length(16),
+                    Constraint::Length(18),
+                    Constraint::Length(7),
+                    Constraint::Length(6),
+                ],
+            )
+        } else if area.width >= 64 {
+            (
+                vec!["", "WORK", "LOCATION", "AGENT / MODEL", ram_label],
+                vec![
+                    Constraint::Length(2),
+                    Constraint::Min(14),
+                    Constraint::Length(12),
+                    Constraint::Length(14),
+                    Constraint::Length(7),
+                ],
+            )
+        } else if area.width >= 48 {
+            (
+                vec!["", "WORK", "LOCATION", "AGENT / MODEL"],
+                vec![
+                    Constraint::Length(2),
+                    Constraint::Min(10),
+                    Constraint::Length(12),
+                    Constraint::Length(12),
+                ],
+            )
+        } else {
+            (
+                vec!["", "WORK", "LOCATION"],
+                vec![
+                    Constraint::Length(2),
+                    Constraint::Min(12),
+                    Constraint::Length(12),
+                ],
+            )
+        }
+    } else if compact {
+        (
+            vec!["PROCESS", "STATE", ram_label],
+            vec![
+                Constraint::Min(12),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        )
+    } else {
+        (
+            vec!["PROCESS", "STATE", ram_label, last_label],
+            vec![
+                Constraint::Min(18),
+                Constraint::Length(14),
+                Constraint::Length(9),
+                Constraint::Length(7),
+            ],
+        )
     };
     let title = match v.page {
         Page::Saved => " Saved · owned RSS ",
@@ -1464,7 +1964,125 @@ fn classification<'a>(s: &Sample, v: &'a View, c: &Conversation) -> Option<&'a s
             && r["conversation"]["provider_home"] == c.provider_home.to_string_lossy().as_ref()
     })
 }
+fn related_summary(e: &Entry, s: &Sample) -> String {
+    let processes = s
+        .owned
+        .get(&e.id)
+        .map(|m| {
+            format!(
+                "{} process{}",
+                m.processes.len(),
+                if m.processes.len() == 1 { "" } else { "es" }
+            )
+        })
+        .unwrap_or("processes unknown".into());
+    let agents = s
+        .state
+        .runs
+        .get(&e.id)
+        .filter(|r| cached_live(r, s) && !r.ended && r.hooks_seen)
+        .map(|r| format!("{} observed agents", r.agents.len()))
+        .unwrap_or("agents unknown".into());
+    format!("{processes} · {agents}")
+}
+fn draw_related(f: &mut ratatui::Frame, area: Rect, s: &Sample, e: &Entry, v: &View) {
+    let run = s.state.runs.get(&e.id);
+    let mut lines = vec![Line::from(
+        run.filter(|r| cached_live(r, s) && !r.ended && r.hooks_seen)
+            .map(|r| {
+                format!(
+                    "Subagents: {} observed{}",
+                    r.agents.len(),
+                    if r.agents.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " · {}",
+                            r.agents
+                                .values()
+                                .take(3)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                )
+            })
+            .unwrap_or("Subagents: unknown · no current hook evidence".into()),
+    )];
+    if let Some(m) = s.owned.get(&e.id) {
+        lines.push(Line::from(format!(
+            "Processes: {} in tracked execution tree",
+            m.processes.len()
+        )));
+        let mut processes: Vec<_> = m
+            .processes
+            .iter()
+            .filter(|p| run.is_none_or(|r| p.pid != r.pid || p.name != "gws"))
+            .collect();
+        processes.sort_by(|a, b| {
+            b.memory
+                .cmp(&a.memory)
+                .then_with(|| b.cpu.total_cmp(&a.cpu))
+                .then(a.pid.cmp(&b.pid))
+        });
+        for p in processes
+            .into_iter()
+            .take(area.height.saturating_sub(5) as usize)
+        {
+            lines.push(Line::from(format!(
+                "{} · {:.0} MiB RSS · {:.1}% CPU (core)",
+                p.name,
+                p.memory as f64 / 1048576.,
+                p.cpu
+            )));
+        }
+    } else {
+        lines.push(Line::from("Process ownership unavailable"));
+    }
+    lines.push(
+        Line::from("Hook agents and OS processes are separate counts.").style(v.theme.muted()),
+    );
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel(
+                if v.paused {
+                    " Related activity · frozen "
+                } else {
+                    " Related activity · t: full tree "
+                }
+                .into(),
+                v.theme,
+                v.ascii,
+            )),
+        area,
+    );
+}
 fn draw_details(f: &mut ratatui::Frame, area: Rect, s: &Sample, item: Option<&Item>, v: &View) {
+    let related = if v.technical {
+        None
+    } else {
+        match item {
+            Some(Item::Saved(e))
+                if s.state.runs.get(&e.id).is_some_and(|r| cached_live(r, s))
+                    || s.owned.get(&e.id).is_some_and(|m| !m.processes.is_empty()) =>
+            {
+                Some(*e)
+            }
+            _ => None,
+        }
+    };
+    let (area, related_area) = if related.is_some() && area.height >= 12 {
+        let c = Layout::vertical([
+            Constraint::Min(7),
+            Constraint::Length(if area.height >= 16 { 7 } else { 5 }),
+        ])
+        .split(area);
+        (c[0], Some(c[1]))
+    } else {
+        (area, None)
+    };
     let mut lines = vec![];
     match item {
         Some(Item::Group(g)) => {
@@ -1507,7 +2125,8 @@ fn draw_details(f: &mut ratatui::Frame, area: Rect, s: &Sample, item: Option<&It
             lines.push(Line::from(display_name(e, s)).style(v.theme.accent()));
             lines.push(Line::from(e.cwd.display().to_string()));
             lines.push(Line::from(format!(
-                "Enter: {} · group {}",
+                "{} · Enter: {} · group {}",
+                attention(e, s, v).1,
                 status(e, s),
                 e.workspace
             )));
@@ -1544,6 +2163,10 @@ fn draw_details(f: &mut ratatui::Frame, area: Rect, s: &Sample, item: Option<&It
                 }
             }
             if v.technical {
+                lines.push(Line::from(format!(
+                    "Agent / recorded launch model: {}",
+                    agent_model(e.agent, Some(e))
+                )));
                 lines.push(Line::from(format!(
                     "{} · {} · {:?}",
                     e.workspace, e.agent, e.intent
@@ -1708,9 +2331,20 @@ fn draw_details(f: &mut ratatui::Frame, area: Rect, s: &Sample, item: Option<&It
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((v.pos().detail_offset, 0))
-            .block(panel(" Selected work · d / Esc ".into(), v.theme, v.ascii)),
+            .block(panel(
+                if let Some(e) = related.filter(|_| related_area.is_none()) {
+                    format!(" Selected · {} · d expands ", related_summary(e, s))
+                } else {
+                    " Selected work · d / Esc ".into()
+                },
+                v.theme,
+                v.ascii,
+            )),
         area,
     );
+    if let Some((e, area)) = related.zip(related_area) {
+        draw_related(f, area, s, e, v);
+    }
 }
 fn depth(mut pid: u32, root: Option<u32>, all: &BTreeMap<u32, Proc>) -> usize {
     let mut depth = 0;
@@ -1812,7 +2446,7 @@ fn draw_plot(
         }
     }
 }
-fn draw_hardware(f: &mut ratatui::Frame, area: Rect, s: &Sample, v: &View) {
+fn draw_hardware(f: &mut ratatui::Frame, area: Rect, s: &Sample, v: &View, column: bool) {
     if !s.ready {
         f.render_widget(
             Paragraph::new(if v.paused {
@@ -1820,7 +2454,16 @@ fn draw_hardware(f: &mut ratatui::Frame, area: Rect, s: &Sample, v: &View) {
             } else {
                 "Collecting machine metrics…"
             })
-            .block(panel(" Usage · h returns ".into(), v.theme, v.ascii)),
+            .block(panel(
+                if column {
+                    " Usage · h expands "
+                } else {
+                    " Usage · h returns "
+                }
+                .into(),
+                v.theme,
+                v.ascii,
+            )),
             area,
         );
         return;
@@ -1890,7 +2533,7 @@ fn draw_hardware(f: &mut ratatui::Frame, area: Rect, s: &Sample, v: &View) {
             }
         )));
     }
-    if area.height < 18 || (area.width < 70 && area.height.saturating_sub(5) < 28) {
+    if !column && (area.height < 18 || (area.width < 70 && area.height.saturating_sub(5) < 28)) {
         if let Some(sensor) = host.and_then(|h| h.sensors.as_ref()) {
             lines.push(Line::from(
                 [
@@ -1919,7 +2562,12 @@ fn draw_hardware(f: &mut ratatui::Frame, area: Rect, s: &Sample, v: &View) {
         );
         return;
     }
-    let sections = Layout::vertical([Constraint::Min(14), Constraint::Length(5)]).split(area);
+    let footer_height = if column && area.height < 33 { 0 } else { 5 };
+    let sections = Layout::vertical([
+        Constraint::Min(if column { 24 } else { 14 }),
+        Constraint::Length(footer_height),
+    ])
+    .split(area);
     let anchor = s.sampled_at.unwrap_or_else(Instant::now);
     let memory = history_segments(
         s.memory_history.iter().copied(),
@@ -1940,7 +2588,7 @@ fn draw_hardware(f: &mut ratatui::Frame, area: Rect, s: &Sample, v: &View) {
             )
         })
         .collect();
-    let slots: Vec<_> = if area.width >= 70 {
+    let slots: Vec<_> = if !column && area.width >= 70 {
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(sections[0])
             .iter()
@@ -1996,21 +2644,65 @@ fn draw_hardware(f: &mut ratatui::Frame, area: Rect, s: &Sample, v: &View) {
         );
         draw_plot(f, slots[i + 1], title, &cpu_gpu[i], v);
     }
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .style(v.theme.muted())
-            .block(panel(
-                if v.paused {
-                    " This Mac · frozen 60s window · h returns ".into()
-                } else {
-                    " This Mac · last 60s · h returns ".into()
-                },
-                v.theme,
-                v.ascii,
+    if column {
+        lines = vec![
+            Line::from(format!(
+                "RAM {:.1}/{:.1} GiB · {}",
+                m.used_bytes as f64 / 1073741824.,
+                m.total_bytes as f64 / 1073741824.,
+                m.pressure.as_deref().unwrap_or("?")
             )),
-        sections[1],
-    );
+            Line::from(format!(
+                "Compressed {} · swap {:.1} GiB",
+                m.compressed_bytes
+                    .map(|n| format!("{:.1}", n as f64 / 1073741824.))
+                    .unwrap_or("?".into()),
+                m.swap_used_bytes as f64 / 1073741824.
+            )),
+        ];
+        if let Some(sensor) = host.and_then(|h| h.sensors.as_ref()) {
+            lines.push(Line::from(format!(
+                "CPU {}°C · GPU {}°C · {}W",
+                sensor
+                    .cpu_temp
+                    .map(|n| format!("{n:.0}"))
+                    .unwrap_or("?".into()),
+                sensor
+                    .gpu_temp
+                    .map(|n| format!("{n:.0}"))
+                    .unwrap_or("?".into()),
+                sensor
+                    .system_power
+                    .map(|n| format!("{n:.1}"))
+                    .unwrap_or("?".into())
+            )));
+        } else {
+            lines.push(Line::from("CPU/GPU: optional macmon"));
+        }
+    }
+    if footer_height > 0 {
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .style(v.theme.muted())
+                .block(panel(
+                    if column {
+                        if v.paused {
+                            " This Mac · frozen · h expand ".into()
+                        } else {
+                            " This Mac · 60s · h expand ".into()
+                        }
+                    } else if v.paused {
+                        " This Mac · frozen 60s window · h returns ".into()
+                    } else {
+                        " This Mac · last 60s · h returns ".into()
+                    },
+                    v.theme,
+                    v.ascii,
+                )),
+            sections[1],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2107,6 +2799,9 @@ mod tests {
             }
         }
         let v = View {
+            binding: None,
+            list_area: None,
+            seen: BTreeMap::new(),
             page: Page::Saved,
             positions: Default::default(),
             searching: false,
@@ -2302,6 +2997,296 @@ mod tests {
         assert!(matches!(update, Update::Ranked(id, _, _, _) if id == retry));
     }
     #[test]
+    fn desktop_overview_has_stacked_usage_and_separate_location_model_columns() {
+        let (mut s, mut v) = fixture();
+        s.state.entries[0].args = vec!["--model=gpt-6-luna".into()];
+        s.state.entries[1].imported = true;
+        let b = render(&s, &mut v, 140, 42);
+        let text = contents(&b);
+        for label in [
+            "LOCATION",
+            "AGENT / MODEL",
+            "Codex/gpt-6-luna",
+            "E CPU",
+            "P CPU",
+            "GPU",
+            "2 saved",
+            "1 need binding",
+        ] {
+            assert!(text.contains(label), "missing {label}");
+        }
+        let sidebar = |label: &str| {
+            (0..b.area.height)
+                .find(|y| {
+                    (106..140)
+                        .map(|x| b[(x, *y)].symbol())
+                        .collect::<String>()
+                        .contains(label)
+                })
+                .unwrap()
+        };
+        assert!(sidebar("RAM") < sidebar("E CPU"));
+        assert!(sidebar("E CPU") < sidebar("P CPU"));
+        assert!(sidebar("P CPU") < sidebar("GPU"));
+        let compact = contents(&render(&s, &mut v, 80, 24));
+        assert!(compact.contains("LOCATION") && compact.contains("Codex/gpt-6-luna"));
+        assert!(!compact.contains("-60s"));
+        v.pos_mut().query = "gpt-6-luna".into();
+        assert_eq!(items(&s, &v).len(), 1);
+        assert_eq!(
+            agent_model(model::Agent::Claude, Some(&s.state.entries[1])),
+            "Claude"
+        );
+        assert!(
+            location_label(std::path::Path::new("/long/project/path/日本語"), 12, false)
+                .ends_with("日本語")
+        );
+    }
+    #[test]
+    fn related_activity_keeps_hook_agents_separate_and_excludes_other_process_trees() {
+        let (mut s, mut v) = fixture();
+        let id = s.state.entries[0].id;
+        let root = Proc {
+            pid: 900,
+            start_time: s.at - 100,
+            name: "codex".into(),
+            memory: 100 * 1048576,
+            cpu: 0.,
+            footprint: None,
+            state: "Running".into(),
+            parent: None,
+        };
+        let child = Proc {
+            pid: 901,
+            parent: Some(root.pid),
+            start_time: root.start_time + 1,
+            name: "owned-preview".into(),
+            memory: 80 * 1048576,
+            cpu: 0.,
+            footprint: None,
+            state: "Running".into(),
+        };
+        let unrelated = Proc {
+            pid: 902,
+            start_time: root.start_time,
+            name: "unrelated-shared-daemon".into(),
+            memory: 200 * 1048576,
+            cpu: 0.,
+            footprint: None,
+            state: "Running".into(),
+            parent: None,
+        };
+        for p in [&root, &child, &unrelated] {
+            s.processes.insert(p.pid, p.clone());
+        }
+        s.state.runs.insert(
+            id,
+            model::Run {
+                pid: root.pid,
+                start_time: root.start_time,
+                hooks_seen: true,
+                agents: BTreeMap::from([
+                    ("one".into(), "review".into()),
+                    ("two".into(), "tests".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        s.owned.insert(
+            id,
+            Metrics {
+                processes: vec![root, child],
+                ..Default::default()
+            },
+        );
+        let text = contents(&render(&s, &mut v, 140, 42));
+        assert!(text.contains("Related activity"));
+        assert!(text.contains("Subagents: 2 observed · review, tests"));
+        assert!(text.contains("Processes: 2 in tracked execution tree"));
+        assert!(text.contains("owned-preview"));
+        assert!(!text.contains("unrelated-shared-daemon"));
+        let compact = contents(&render(&s, &mut v, 80, 24));
+        assert!(compact.contains("2 processes · 2 observed agents"));
+        s.state.runs.get_mut(&id).unwrap().hooks_seen = false;
+        let text = contents(&render(&s, &mut v, 140, 42));
+        assert!(text.contains("Subagents: unknown"));
+        assert!(!text.contains("Subagents: 0"));
+        v.detail_only = true;
+        v.pos_mut().identity = Some(s.state.entries[1].id.to_string());
+        assert!(!contents(&render(&s, &mut v, 140, 42)).contains("owned-preview"));
+    }
+    #[test]
+    fn completion_markers_persist_read_state_and_fence_old_runs_and_new_turns() {
+        let (mut s, v) = fixture();
+        let id = s.state.entries[0].id;
+        let token = Uuid::new_v4();
+        let run = s.state.runs.get_mut(&id).unwrap();
+        run.token = token;
+        run.completed_turns = 2;
+        run.last_turn_end = Some(s.at);
+        assert_eq!(attention(&s.state.entries[0], &s, &v).0, "◆");
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(Some(temp.path().into())).unwrap();
+        store
+            .update(|state| {
+                *state = s.state.clone();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .document::<model::Attention>("attention", &token.to_string())
+                .unwrap()
+                .unwrap()
+                .completed_turns,
+            2,
+            "completion metadata must commit atomically with run state"
+        );
+        record_seen(&store, id, token, 2, true).unwrap();
+        s.state = store.read().unwrap();
+        assert_eq!(attention(&s.state.entries[0], &s, &v).0, "○");
+        store
+            .edit_document("attention", &token.to_string(), |old| {
+                let mut attention: model::Attention = serde_json::from_value(old.unwrap())?;
+                attention.completed_turns = 3;
+                Ok(attention)
+            })
+            .unwrap();
+        record_seen(&store, id, token, 2, true).unwrap();
+        s.state = store.read().unwrap();
+        assert_eq!(attention(&s.state.entries[0], &s, &v).0, "◆");
+        let newer = Uuid::new_v4();
+        // Simulate an older running supervisor rewriting only the fields it knows.
+        let c = rusqlite::Connection::open(store.database()).unwrap();
+        c.execute("UPDATE runs SET body=json_remove(body,'$.completed_turns','$.seen_turns','$.last_turn_end','$.exit_seen') WHERE item_id=?1", [id.to_string()]).unwrap();
+        drop(c);
+        assert_eq!(store.read().unwrap().runs[&id].completed_turns, 3);
+        assert_eq!(store.read().unwrap().runs[&id].seen_turns, 2);
+        store
+            .update(|state| {
+                let r = state.runs.get_mut(&id).unwrap();
+                r.token = newer;
+                r.seen_turns = 0;
+                r.exit_seen = false;
+                Ok(())
+            })
+            .unwrap();
+        record_seen(&store, id, token, 3, true).unwrap();
+        assert_eq!(store.read().unwrap().runs[&id].seen_turns, 0);
+        assert!(!store.read().unwrap().runs[&id].exit_seen);
+        let r = s.state.runs.get_mut(&id).unwrap();
+        r.ended = false;
+        r.pid = 988;
+        r.start_time = s.at;
+        r.hooks_seen = true;
+        r.activity = "working".into();
+        s.processes.insert(
+            988,
+            Proc {
+                pid: 988,
+                parent: None,
+                name: "codex".into(),
+                cpu: 0.,
+                memory: 0,
+                start_time: s.at,
+                footprint: None,
+                state: "Running".into(),
+            },
+        );
+        assert_eq!(attention(&s.state.entries[0], &s, &v).0, "●");
+        s.state.runs.get_mut(&id).unwrap().activity = "unknown".into();
+        s.state.runs.get_mut(&id).unwrap().last_turn_end = None;
+        assert_eq!(attention(&s.state.entries[0], &s, &v).0, "·");
+    }
+    #[test]
+    fn native_focus_acknowledges_only_the_observed_surface_and_completion() {
+        let (mut s, _) = fixture();
+        let id = s.state.entries[0].id;
+        let run = s.state.runs.get_mut(&id).unwrap();
+        run.token = Uuid::new_v4();
+        run.terminal_id = Some("selected-split".into());
+        run.completed_turns = 2;
+        run.seen_turns = 0;
+        run.last_turn_end = Some(s.at);
+        run.ended = false;
+        let token = run.token;
+        // A stale entry surface must not override the current run surface.
+        s.state.entries[0].terminal_id = Some("other-split".into());
+        let windows = vec![Window {
+            id: "front-window".into(),
+            tabs: vec![ghostty::Tab {
+                id: "selected-tab".into(),
+                name: "two splits".into(),
+                terminals: ["selected-split", "other-split"]
+                    .into_iter()
+                    .map(|id| ghostty::Surface {
+                        id: id.into(),
+                        cwd: "/project".into(),
+                    })
+                    .collect(),
+            }],
+        }];
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(Some(temp.path().into())).unwrap();
+        store
+            .update(|state| {
+                *state = s.state.clone();
+                Ok(())
+            })
+            .unwrap();
+        for focus in [None, Some("other-split"), Some("missing-surface")] {
+            record_visible_completion(&store, &s.state, focus, &windows).unwrap();
+            assert_eq!(store.read().unwrap().runs[&id].seen_turns, 0);
+        }
+        // A completion arriving during automation must remain unread.
+        store
+            .edit_document("attention", &token.to_string(), |_| {
+                Ok(model::Attention {
+                    completed_turns: 3,
+                    last_turn_end: Some(s.at),
+                    ..Default::default()
+                })
+            })
+            .unwrap();
+        record_visible_completion(&store, &s.state, Some("selected-split"), &windows).unwrap();
+        let read = store.read().unwrap();
+        assert_eq!(read.runs[&id].seen_turns, 2);
+        assert_eq!(read.runs[&id].completed_turns, 3);
+        assert!(!read.runs[&id].exit_seen);
+        s.state = read;
+        // Ambiguous ownership is not acknowledged by guessing.
+        s.state
+            .runs
+            .insert(s.state.entries[1].id, s.state.runs[&id].clone());
+        record_visible_completion(&store, &s.state, Some("selected-split"), &windows).unwrap();
+        assert_eq!(store.read().unwrap().runs[&id].seen_turns, 2);
+        s.state.runs.remove(&s.state.entries[1].id);
+        record_visible_completion(&store, &s.state, Some("selected-split"), &windows).unwrap();
+        assert_eq!(store.read().unwrap().runs[&id].seen_turns, 3);
+    }
+    #[test]
+    fn bind_marker_hit_testing_tracks_scroll_and_never_treats_headers_as_items() {
+        let (mut s, mut v) = fixture();
+        s.state.entries[0].imported = true;
+        s.state.entries[0].session_verified = false;
+        let b = render(&s, &mut v, 140, 42);
+        let area = v.list_area.unwrap();
+        assert_eq!(b[(area.x + 4, area.y + 2)].symbol(), "?");
+        assert_eq!(clicked_row(&v, 2, area.x + 4, area.y + 2), Some((0, true)));
+        assert_eq!(clicked_row(&v, 2, area.x + 8, area.y + 2), Some((0, false)));
+        assert_eq!(clicked_row(&v, 2, area.x + 4, area.y + 1), None);
+        *v.pos_mut().table.offset_mut() = 1;
+        assert_eq!(clicked_row(&v, 2, area.x + 4, area.y + 2), Some((1, true)));
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(Some(temp.path().join("space ' state"))).unwrap();
+        let command = bind_command(&store, &s.state.entries[0]).unwrap();
+        assert!(command.starts_with("!gws --state-dir '"));
+        assert!(command.contains("'\\''"));
+        assert!(command.ends_with(&format!("bind-here --item {}", s.state.entries[0].id)));
+        v.binding = Some(s.state.entries[0].id);
+        assert_eq!(clicked_row(&v, 2, area.x + 4, area.y + 2), None);
+    }
+    #[test]
     #[ignore = "requires GWS_RENDER_DIR for synthetic visual review artifacts"]
     fn render_review_artifacts() {
         let Ok(root) = std::env::var("GWS_RENDER_DIR") else {
@@ -2336,6 +3321,12 @@ mod tests {
                 workspace: "demo".into(),
                 cwd: cwd.clone().into(),
                 agent,
+                args: match i {
+                    0 => vec!["--model=gpt-6-luna".into()],
+                    1 => vec!["--model=sonnet".into()],
+                    2 => vec!["--model=gpt-6-sol".into()],
+                    _ => vec![],
+                },
                 ever_started: true,
                 session_verified: i != 7,
                 session_id: (i != 7).then_some(Uuid::from_u128(i as u128 + 100)),
@@ -2354,6 +3345,7 @@ mod tests {
                 token: Uuid::from_u128(i as u128 + 200),
                 ended: !active,
                 exit_code: (!active).then_some(0),
+                exit_seen: i == 6 || i == 8,
                 hooks_seen: i < 2,
                 activity: if active { "working" } else { "ended" }.into(),
                 ..Default::default()
@@ -2401,6 +3393,26 @@ mod tests {
             }
             s.state.runs.insert(id, run);
         }
+        let owner = Uuid::from_u128(1);
+        for (pid, name, mib, cpu) in [(42001, "node", 160, 1.8), (42002, "python3", 64, 0.8)] {
+            let p = Proc {
+                pid,
+                parent: Some(41000),
+                name: name.into(),
+                memory: mib * 1048576,
+                cpu,
+                start_time: s.at - 1200,
+                state: "Running".into(),
+                footprint: Some(mib * 1048576),
+            };
+            let m = s.owned.get_mut(&owner).unwrap();
+            m.memory += p.memory;
+            m.cpu += p.cpu;
+            m.footprint = Some(m.footprint.unwrap() + p.memory);
+            m.footprint_coverage += 1;
+            m.processes.push(p.clone());
+            s.processes.insert(pid, p);
+        }
         s.windows = vec![Window {
             id: "demo-window".into(),
             tabs,
@@ -2426,7 +3438,12 @@ mod tests {
             },
         );
         v.message = "Demo · all data synthetic · Enter: focus/resume · /: search".into();
-        for (name, w, h) in [("wide", 140, 42), ("compact", 80, 24), ("narrow", 40, 20)] {
+        for (name, w, h) in [
+            ("wide", 140, 42),
+            ("desktop", 100, 30),
+            ("compact", 80, 24),
+            ("narrow", 40, 20),
+        ] {
             let b = render(&s, &mut v, w, h);
             let cells:Vec<_>=b.content.iter().map(|c|serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD),"reverse":c.modifier.contains(Modifier::REVERSED)})).collect();
             std::fs::write(
@@ -2479,6 +3496,9 @@ mod performance_tests {
         }
         s.search_revision = search_signature(&s);
         let mut v = View {
+            binding: None,
+            list_area: None,
+            seen: BTreeMap::new(),
             page: Page::History,
             positions: Default::default(),
             searching: false,

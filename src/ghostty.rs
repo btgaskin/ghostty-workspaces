@@ -21,6 +21,11 @@ pub struct Surface {
     pub id: String,
     pub cwd: String,
 }
+#[derive(Debug, Deserialize)]
+pub struct Snapshot {
+    pub windows: Vec<Window>,
+    pub focused_terminal: Option<String>,
+}
 
 pub fn jxa(source: &str) -> Result<String> {
     let mut child = Command::new("/usr/bin/osascript")
@@ -74,8 +79,21 @@ pub fn jxa(source: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 pub fn snapshot() -> Result<Vec<Window>> {
+    Ok(snapshot_with_focus()?.windows)
+}
+pub fn snapshot_with_focus() -> Result<Snapshot> {
     let text = jxa(r#"const a=Application('Ghostty');
-JSON.stringify(a.windows().map(w=>({id:w.id(),tabs:w.tabs().map(t=>({id:t.id(),name:t.name(),terminals:t.terminals().map(p=>({id:p.id(),cwd:p.workingDirectory()}))}))})))"#)?;
+const windows=a.windows().map(w=>({id:w.id(),tabs:w.tabs().map(t=>({id:t.id(),name:t.name(),terminals:t.terminals().map(p=>({id:p.id(),cwd:p.workingDirectory()}))}))}));
+let focused_terminal=null;
+try {
+    if(a.frontmost()) {
+        const w=a.frontWindow(), wid=w.id(), t=w.selectedTab(), tid=t.id();
+        const id=t.focusedTerminal().id();
+        if(a.frontmost() && a.frontWindow().id()===wid && w.selectedTab().id()===tid && t.focusedTerminal().id()===id)
+            focused_terminal=id;
+    }
+} catch (_) {} // Focus is optional; inventory remains usable on older scripting interfaces.
+JSON.stringify({windows,focused_terminal})"#)?;
     serde_json::from_str(&text).context("Ghostty returned an unexpected layout")
 }
 pub fn quote(s: &str) -> String {
